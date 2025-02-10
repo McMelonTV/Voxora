@@ -2,6 +2,7 @@ import {View, Text, StyleSheet} from 'react-native';
 import {useEffect} from "react";
 import {XMLParser, XMLValidator} from "fast-xml-parser";
 import {IXmlRoot} from "~/types/rss/xml/IXmlRoot";
+import PodcastGrid from "~/components/PodcastGrid";
 
 export default function Tab() {
     useEffect(() => {
@@ -21,7 +22,7 @@ export default function Tab() {
 
     return (
         <View style={styles.container}>
-            <Text>Tab [Home|Settings]</Text>
+            <PodcastGrid />
         </View>
     );
 }

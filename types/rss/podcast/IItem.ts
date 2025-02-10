@@ -1,6 +1,6 @@
 import {IGuid} from "~/types/rss/xml/common/IGuid";
 import {IEnclosure} from "~/types/rss/xml/common/IEnclosure";
-import {IItunesImage2} from "~/types/rss/podcast/itunes/IItunesImage2";
+import {IItunesImage} from "~/types/rss/podcast/itunes/IItunesImage";
 
 export interface IItem {
     title: string
@@ -10,7 +10,7 @@ export interface IItem {
     "itunes:title"?: string
     "itunes:episodeType": string
     "itunes:author": string
-    "itunes:image"?: IItunesImage2
+    "itunes:image"?: IItunesImage
     "itunes:subtitle": string
     "itunes:summary": string
     "content:encoded": string
