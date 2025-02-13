@@ -1,5 +1,6 @@
 # Learn more https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files
 .idea/
+components/dnd-grid/ # https://github.com/McMelonTV/rn-dnd-grid
 
 # dependencies
 node_modules/

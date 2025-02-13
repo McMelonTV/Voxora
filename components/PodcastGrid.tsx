@@ -1,69 +1,83 @@
+import {useState} from 'react';
 import {
-    DndProvider,
-    type ObjectWithId,
-    Draggable,
-    DraggableGrid,
-    DraggableGridProps,
-} from "@mgcrea/react-native-dnd";
-import { StyleSheet, Text, View } from "react-native";
-
-const GRID_SIZE = 3;
-const items: string[] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
-const data = items.map((letter, index) => ({
-    id: `${index}-${letter}`,
-    value: letter,
-})) satisfies ObjectWithId[];
+    View,
+    StyleSheet,
+    Text, Dimensions,
+} from 'react-native';
+import {DraggableGrid} from "~/components/dnd-grid/src";
+import {ScrollView} from "react-native-gesture-handler";
 
 export default function PodcastGrid() {
-    const onGridOrderChange: DraggableGridProps["onOrderChange"] = (value) => {
-        console.log("onGridOrderChange", value);
-    };
+    const [data, setData] = useState([
+        {name: '1', key: 'one'},
+        {name: '2', key: 'two'},
+        {name: '3', key: 'three'},
+        {name: '4', key: 'four'},
+        {name: '5', key: 'five'},
+        {name: '6', key: 'six'},
+        {name: '7', key: 'seven'},
+        {name: '8', key: 'eight'},
+        {name: '9', key: 'night'},
+        {name: '10', key: 'ten'},
+        {name: '11', key: 'eleven'},
+        {name: '12', key: 'twelve'},
+        {name: '13', key: 'thirteen'},
+        {name: '14', key: 'fourteen'},
+        {name: '15', key: 'fifteen'},
+        {name: '16', key: 'sixteen'},
+        {name: '17', key: 'seventeen'},
+        {name: '18', key: 'eighteen'},
+        {name: '19', key: 'nineteen'},
+        {name: '20', key: 'twenty'},
+    ]);
 
-    return (
-        <View style={styles.container}>
-            <Text style={styles.title}>DraggableGrid{"\n"}Example</Text>
-            <DndProvider>
-                <DraggableGrid direction="row" size={GRID_SIZE} style={styles.grid} onOrderChange={onGridOrderChange}>
-                    {data.map((item) => (
-                        <Draggable key={item.id} id={item.id} style={styles.draggable}>
-                            <Text style={styles.text}>{item.value}</Text>
-                        </Draggable>
-                    ))}
-                </DraggableGrid>
-            </DndProvider>
+    const [dragging, setDragging] = useState(false);
+
+    const gap = 20;
+    const windowWidth = Dimensions.get('window').width;
+    const itemSize = 100;
+    const numColumns = Math.floor(windowWidth / (itemSize + gap / 2));
+
+    const render_item = (item: { name: string, key: string }) => (
+        <View style={{width: itemSize, height: itemSize, ...styles.item}} key={item.key}>
+            <Text style={styles.item_text}>{item.name}</Text>
         </View>
     );
-};
+
+    return (
+        <ScrollView style={styles.wrapper} scrollEnabled={!dragging}>
+            <DraggableGrid
+                numColumns={numColumns}
+                renderItem={render_item}
+                data={data}
+                onItemPress={() => setDragging(true)}
+                onDragItemActive={() => setDragging(true)}
+                onDragRelease={(newData) => {
+                    setData(newData);
+                    setDragging(false);
+                }}
+                delayLongPress={100}
+                gap={gap}
+            />
+        </ScrollView>
+    );
+}
 
 const styles = StyleSheet.create({
-    container: {
-        flex: 1,
-        justifyContent: "center",
-        alignItems: "center",
-        backgroundColor: "#F5FCFF",
+    wrapper: {
+        width: '100%',
+        height: '100%',
+        overflow: 'scroll',
     },
-    title: {
-        fontSize: 20,
-        textAlign: "center",
-        margin: 10,
+    item: {
+        borderRadius: 8,
+        backgroundColor: 'red',
+        justifyContent: 'center',
+        alignItems: 'center',
     },
-    grid: {
-        flex: 1,
-        flexDirection: "row",
-        flexWrap: "wrap",
-        justifyContent: "center",
-        alignItems: "center",
-    },
-    draggable: {
-        width: 80,
-        height: 80,
-        margin: 10,
-        backgroundColor: "#F5FCFF",
-        justifyContent: "center",
-        alignItems: "center",
-    },
-    text: {
-        fontSize: 20,
-        textAlign: "center",
+    item_text: {
+        fontSize: 40,
+        color: '#FFFFFF',
     },
 });
+
