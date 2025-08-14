@@ -4,8 +4,8 @@ use (
 	./lib/libvoxora
 	./app/voxora_tui
 	./plugin/template
-	./plugin/core
-	./plugin/rss
-	./plugin/spotify
+	./plugin/local
 	./plugin/youtube
+	./plugin/spotify
+	./plugin/rss
 )

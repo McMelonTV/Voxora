@@ -3,8 +3,8 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/Voxora.iml" filepath="$PROJECT_DIR$/Voxora.iml" />
-      <module fileurl="file://$PROJECT_DIR$/core.iml" filepath="$PROJECT_DIR$/core.iml" />
       <module fileurl="file://$PROJECT_DIR$/libvoxora.iml" filepath="$PROJECT_DIR$/libvoxora.iml" />
+      <module fileurl="file://$PROJECT_DIR$/local.iml" filepath="$PROJECT_DIR$/local.iml" />
       <module fileurl="file://$PROJECT_DIR$/rss.iml" filepath="$PROJECT_DIR$/rss.iml" />
       <module fileurl="file://$PROJECT_DIR$/spotify.iml" filepath="$PROJECT_DIR$/spotify.iml" />
       <module fileurl="file://$PROJECT_DIR$/template.iml" filepath="$PROJECT_DIR$/template.iml" />
