@@ -8,6 +8,7 @@ import (
 type PluginImpl struct {
 	schemaVersion uint32
 	version       uint32
+	name          string
 	testThing     types.GOThing
 }
 
@@ -19,6 +20,10 @@ func (p *PluginImpl) Version() uint32 {
 	return p.version
 }
 
+func (p *PluginImpl) Name() string {
+	return p.name
+}
+
 func (p *PluginImpl) TestThing() types.GOThing {
 	return p.testThing
 }
@@ -27,6 +32,7 @@ func Init() plugin_schema.VoxoraPluginV1 {
 	return &PluginImpl{
 		schemaVersion: 1, // has to match the plugin interface (1 for VoxoraPluginV1)
 		version:       1, // incremental numeric versioning, should start at 1
+		name:          "Template",
 		testThing: types.GOThing{
 			A: 0,
 			B: 'a',

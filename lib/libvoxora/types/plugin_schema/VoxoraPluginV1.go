@@ -11,5 +11,7 @@ type VoxoraPluginV1 interface {
 	// This should be updated whenever the plugin's code changes.
 	Version() uint32
 
+	Name() string // TODO: make sure the *C.char always gets freed on unload
+
 	TestThing() types.GOThing
 }

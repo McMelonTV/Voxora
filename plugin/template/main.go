@@ -23,6 +23,11 @@ func Version() C.uint32_t {
 	return C.uint32_t(Plugin.Version())
 }
 
+//export Name
+func Name() *C.char {
+	return C.CString(Plugin.Name())
+}
+
 //export TestThing
 func TestThing() C.Thing {
 	goThing := Plugin.TestThing()
