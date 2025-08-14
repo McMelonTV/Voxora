@@ -1,20 +1,18 @@
 package main
 
-import "C"
 import (
+	"voxora/lib/libvoxora/types/plugin/plugin_v1"
 	"voxora/plugin/template/impl"
 )
 
 var PluginSchema = impl.Init()
 
-//export Meta
-func Meta() interface{} {
-	return *PluginSchema.Meta() // TODO: find out if this is supposed to be a pointer or not
+func Meta() plugin_v1.PluginV1MetaImpl {
+	return *PluginSchema.Meta()
 }
 
-//export Plugin
-func Plugin() interface{} {
-	return *PluginSchema.Plugin() // TODO: find out if this is supposed to be a pointer or not
+func Plugin() plugin_v1.PluginV1 {
+	return *PluginSchema.Plugin()
 }
 
 func main() {}
