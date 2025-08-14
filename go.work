@@ -1,0 +1,11 @@
+go 1.25.0
+
+use (
+	./lib/libvoxora
+	./app/voxora_tui
+	./plugin/template
+	./plugin/core
+	./plugin/rss
+	./plugin/spotify
+	./plugin/youtube
+)
