@@ -15,22 +15,22 @@ var Plugin = impl.Init()
 
 //export SchemaVersion
 func SchemaVersion() C.uint32_t {
-	return C.uint32_t(Plugin.SchemaVersion())
+	return C.uint32_t(Plugin.PluginMeta().SchemaVersion())
 }
 
 //export Version
 func Version() C.uint32_t {
-	return C.uint32_t(Plugin.Version())
+	return C.uint32_t(Plugin.PluginMeta().Version())
 }
 
 //export Name
 func Name() *C.char {
-	return C.CString(Plugin.Name())
+	return C.CString(Plugin.PluginMeta().Name())
 }
 
 //export TestThing
 func TestThing() C.Thing {
-	goThing := Plugin.TestThing()
+	goThing := *Plugin.TestThing()
 	thing := types.GOThingToCThing(goThing)
 	cThing := *(*C.Thing)(unsafe.Pointer(&thing))
 	return cThing

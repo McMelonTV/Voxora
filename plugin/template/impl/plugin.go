@@ -5,35 +5,45 @@ import (
 	"voxora/lib/libvoxora/types/plugin_schema"
 )
 
-type PluginImpl struct {
+type PluginMeta struct {
 	schemaVersion uint32
 	version       uint32
 	name          string
-	testThing     types.GOThing
 }
 
-func (p *PluginImpl) SchemaVersion() uint32 {
-	return p.schemaVersion
+func (m *PluginMeta) SchemaVersion() uint32 {
+	return m.schemaVersion
 }
 
-func (p *PluginImpl) Version() uint32 {
-	return p.version
+func (m *PluginMeta) Version() uint32 {
+	return m.version
 }
 
-func (p *PluginImpl) Name() string {
-	return p.name
+func (m *PluginMeta) Name() string {
+	return m.name
 }
 
-func (p *PluginImpl) TestThing() types.GOThing {
+type PluginImpl struct {
+	pluginMeta *PluginMeta
+	testThing  *types.GOThing
+}
+
+func (p *PluginImpl) PluginMeta() plugin_schema.VoxoraPluginMetaV1 {
+	return p.pluginMeta
+}
+
+func (p *PluginImpl) TestThing() *types.GOThing {
 	return p.testThing
 }
 
 func Init() plugin_schema.VoxoraPluginV1 {
 	return &PluginImpl{
-		schemaVersion: 1, // has to match the plugin interface (1 for VoxoraPluginV1)
-		version:       1, // incremental numeric versioning, should start at 1
-		name:          "Template",
-		testThing: types.GOThing{
+		pluginMeta: &PluginMeta{
+			schemaVersion: 1, // has to match the plugin interface (1 for VoxoraPluginV1)
+			version:       1, // incremental numeric versioning, should start at 1
+			name:          "Template",
+		},
+		testThing: &types.GOThing{
 			A: 0,
 			B: 'a',
 		},

@@ -2,7 +2,7 @@ package plugin_schema
 
 import "voxora/lib/libvoxora/types"
 
-type VoxoraPluginV1 interface {
+type VoxoraPluginMetaV1 interface {
 	// SchemaVersion returns the version of the Voxora plugin schema
 	// this plugin implements (e.g., 1 for VoxoraPluginV1).
 	SchemaVersion() uint32
@@ -12,6 +12,9 @@ type VoxoraPluginV1 interface {
 	Version() uint32
 
 	Name() string // TODO: make sure the *C.char always gets freed on unload
+}
 
-	TestThing() types.GOThing
+type VoxoraPluginV1 interface {
+	PluginMeta() VoxoraPluginMetaV1
+	TestThing() *types.GOThing
 }
