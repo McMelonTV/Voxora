@@ -1,3 +1,10 @@
+# Supported Platforms
+
+- Linux
+- Windows
+- Android
+- Web for controlling linux TUI?
+
 # Developing Plugins
 
 ## Building
