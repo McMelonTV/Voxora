@@ -43,3 +43,6 @@ voxora/deployment-settings.json
 
 # Ignore generated Android project tree entirely
 voxora/android-build/
+
+spotify-dl-on-steroids
+third_party

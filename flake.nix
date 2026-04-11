@@ -215,6 +215,7 @@
         packages = [
           goTool
           dockerPackage
+          pkgs.ffmpeg
           pkgs.jdk17
           nixFormatter
           mesaDemos
