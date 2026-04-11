@@ -61,6 +61,8 @@ type interactiveAuthOutcome struct {
 	err    error
 }
 
+var ErrNoStoredCredentials = errors.New("no stored spotify credentials found")
+
 func defaultCredentialsFile() (string, error) {
 	configDir, err := os.UserConfigDir()
 	if err != nil {
@@ -318,6 +320,114 @@ func PersistInteractiveAuthResult(ctx context.Context, cfg Config, result Intera
 	}
 	sess.Close()
 	return nil
+}
+
+// TryStoredCredentialsSession attempts to authenticate using only cached
+// stored credentials. It does not trigger the browser OAuth flow.
+func TryStoredCredentialsSession(ctx context.Context, cfg Config) error {
+	credentialsFile, err := resolveCredentialsFile(cfg.Auth.CredentialsFile)
+	if err != nil {
+		return err
+	}
+
+	cache, err := loadCredentialCache(credentialsFile)
+	if err != nil {
+		return err
+	}
+	if cache == nil || strings.TrimSpace(cache.Username) == "" || strings.TrimSpace(cache.StoredCredentials) == "" {
+		return ErrNoStoredCredentials
+	}
+
+	stored, err := base64.StdEncoding.DecodeString(cache.StoredCredentials)
+	if err != nil {
+		return fmt.Errorf("decode cached stored credentials: %w", err)
+	}
+
+	deviceID := strings.TrimSpace(cfg.Auth.DeviceID)
+	if deviceID == "" && !isLegacyHexDeviceID(cache.DeviceID) {
+		deviceID = strings.TrimSpace(cache.DeviceID)
+	}
+	if deviceID == "" {
+		deviceID, err = randomDeviceID()
+		if err != nil {
+			return err
+		}
+	}
+
+	log := cfg.Logger
+	if log == nil {
+		log = newDefaultLogger()
+	}
+
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	sess, err := librespotsession.NewSessionFromOptions(ctx, &librespotsession.Options{
+		Log:        log,
+		Client:     client,
+		DeviceType: devicespb.DeviceType_COMPUTER,
+		DeviceId:   deviceID,
+		Credentials: librespotsession.StoredCredentials{
+			Username: cache.Username,
+			Data:     stored,
+		},
+	})
+	if err != nil {
+		return withSessionTroubleshooting(fmt.Errorf("authenticate with stored credentials: %w", err))
+	}
+	sess.Close()
+	return nil
+}
+
+// IsSpotifyCredentialRefusedError returns true when an auth failure appears to
+// come from rejected credentials rather than network/connectivity issues.
+func IsSpotifyCredentialRefusedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	networkHints := []string{
+		"apresolve.spotify.com",
+		"dial tcp",
+		"connection refused",
+		"no such host",
+		"i/o timeout",
+		"context deadline exceeded",
+		"network is unreachable",
+		"proxy",
+		"tls handshake timeout",
+		"temporary failure in name resolution",
+	}
+	for _, hint := range networkHints {
+		if strings.Contains(msg, hint) {
+			return false
+		}
+	}
+
+	authHints := []string{
+		"bad credentials",
+		"invalid credentials",
+		"authentication failed",
+		"auth failed",
+		"login failed",
+		"login5",
+		"could not authenticate",
+		"couldn't authenticate",
+		"forbidden",
+		"status 401",
+		"status 403",
+	}
+	for _, hint := range authHints {
+		if strings.Contains(msg, hint) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func resolveSessionCredentials(ctx context.Context, cfg Config, log librespot.Logger, client *http.Client, deviceID string, cache *credentialCache) (any, error) {
