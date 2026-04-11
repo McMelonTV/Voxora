@@ -29,9 +29,13 @@
         qtdeclarative
         qtsvg
       ];
+      qtToolPath = lib.concatStringsSep ":" [
+        "${pkgs.qt6.qtbase}/libexec"
+        "${pkgs.qt6.qtdeclarative}/libexec"
+      ];
       androidPackages = pkgs.androidenv.composeAndroidPackages {
-        buildToolsVersions = [ "33.0.0" ];
-        platformVersions = [ "33" ];
+        buildToolsVersions = [ "36.0.0" ];
+        platformVersions = [ "36" ];
         abiVersions = [ "arm64-v8a" ];
         includeNDK = true;
         ndkVersions = [ "25.1.8937393" ];
@@ -54,6 +58,7 @@
         export CGO_ENABLED=1
         export PKG_CONFIG_PATH="${pkgConfigPath}''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
         export LD_LIBRARY_PATH="${libraryPath}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        export PATH="${qtToolPath}:$PATH"
         export QT_PLUGIN_PATH="${qtPluginPath}''${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
         export QML2_IMPORT_PATH="${qmlImportPath}''${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
       '';
@@ -76,65 +81,11 @@
         export ANDROID_NDK_HOME="${androidNdkRoot}"
         export ANDROID_NDK_ROOT="${androidNdkRoot}"
         export JAVA_HOME="${pkgs.jdk17}"
-        export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdkRoot}/build-tools/33.0.0/aapt2''${GRADLE_OPTS:+ $GRADLE_OPTS}"
+        export GRADLE_OPTS="-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdkRoot}/build-tools/36.0.0/aapt2''${GRADLE_OPTS:+ $GRADLE_OPTS}"
       '';
       repoRootCheck = ''
         if [ ! -f "$PWD/voxora/go.mod" ]; then
           printf '%s\n' "Run this command from the repository root." >&2
-          exit 1
-        fi
-      '';
-      androidApkDiscovery = ''
-        apkPath=""
-        for candidate in "$repoRoot/voxora"/*.apk; do
-          [ -e "$candidate" ] || continue
-          apkPath="$candidate"
-          break
-        done
-
-        if [ -z "$apkPath" ]; then
-          printf '%s\n' "No APK found in $repoRoot/voxora after the Android build." >&2
-          exit 1
-        fi
-      '';
-      androidPackageDiscovery = ''
-        packageName="org.qtproject.example.voxora"
-
-        if [ -f "$repoRoot/voxora/android-build/AndroidManifest.xml" ]; then
-          while IFS= read -r line; do
-            case "$line" in
-              *package=\"*\"*)
-                packageName=''${line#*package=\"}
-                packageName=''${packageName%%\"*}
-                break
-                ;;
-            esac
-          done < "$repoRoot/voxora/android-build/AndroidManifest.xml"
-        fi
-      '';
-      androidDeviceDiscovery = ''
-        adbPath="$ANDROID_SDK_ROOT/platform-tools/adb"
-        if [ ! -x "$adbPath" ]; then
-          printf '%s\n' "adb was not found at $adbPath" >&2
-          exit 1
-        fi
-
-        serial=""
-        headerSeen=0
-        while IFS=$'\t' read -r deviceSerial deviceState _; do
-          if [ "$headerSeen" -eq 0 ]; then
-            headerSeen=1
-            continue
-          fi
-
-          if [ "$deviceState" = "device" ]; then
-            serial="$deviceSerial"
-            break
-          fi
-        done < <("$adbPath" devices)
-
-        if [ -z "$serial" ]; then
-          printf '%s\n' "No running adb devices or emulators found." >&2
           exit 1
         fi
       '';
@@ -145,6 +96,17 @@
         src = miqtSrc;
         subPackages = [ "cmd/miqt-docker" ];
         vendorHash = null;
+      };
+
+      miqtRcc = pkgs.buildGoModule {
+        pname = "miqt-rcc";
+        version = "qt_611";
+        src = miqtSrc;
+        subPackages = [ "cmd/miqt-rcc" ];
+        vendorHash = null;
+        preCheck = ''
+          export PATH="${pkgs.qt6.qtbase}/libexec:$PATH"
+        '';
       };
 
       voxoraRun = pkgs.writeShellApplication {
@@ -194,27 +156,6 @@
         '';
       };
 
-      voxoraAndroidLaunch = pkgs.writeShellApplication {
-        name = "voxora-android-launch";
-        runtimeInputs = [ goTool dockerPackage miqtDocker ] ++ qtPackages ++ [ androidPackages.androidsdk pkgs.jdk17 pkgConfig pkgs.gcc ];
-        text = ''
-          set -euo pipefail
-          ${repoRootCheck}
-          ${commonEnv}
-          ${androidEnv}
-          repoRoot="$PWD"
-          ${androidDeviceDiscovery}
-
-          cd "$repoRoot/voxora"
-          miqt-docker android-qt6 -android-build "$@"
-          cd "$repoRoot"
-          ${androidApkDiscovery}
-          ${androidPackageDiscovery}
-          "$adbPath" -s "$serial" install -r "$apkPath"
-          exec "$adbPath" -s "$serial" shell monkey -p "$packageName" -c android.intent.category.LAUNCHER 1
-        '';
-      };
-
       app = program: description: {
         type = "app";
         inherit program;
@@ -229,8 +170,8 @@
         run = voxoraRun;
         "desktop-build" = voxoraDesktopBuild;
         "android-build" = voxoraAndroidBuild;
-        "android-launch" = voxoraAndroidLaunch;
         "miqt-docker" = miqtDocker;
+        "miqt-rcc" = miqtRcc;
       };
 
       apps.${system} = {
@@ -238,8 +179,8 @@
         run = app "${voxoraRun}/bin/voxora-run" "Run the desktop app using host GL libraries";
         "desktop-build" = app "${voxoraDesktopBuild}/bin/voxora-desktop-build" "Build the desktop binary into dist/";
         "android-build" = app "${voxoraAndroidBuild}/bin/voxora-android-build" "Build the Android APK";
-        "android-launch" = app "${voxoraAndroidLaunch}/bin/voxora-android-launch" "Install and launch the Android app on the first adb device";
         "miqt-docker" = app "${miqtDocker}/bin/miqt-docker" "Run the raw miqt-docker helper";
+        "miqt-rcc" = app "${miqtRcc}/bin/miqt-rcc" "Generate MIQT Qt resource wrappers";
       };
 
       devShells.${system}.default = pkgs.mkShell {
@@ -253,13 +194,14 @@
           pkgs.gcc
           androidPackages.androidsdk
           miqtDocker
+          miqtRcc
         ] ++ qtPackages;
 
         shellHook = ''
           ${commonEnv}
           ${androidEnv}
 
-          printf '%s\n' "Available commands: nix run .#run, nix run .#desktop-build, nix run .#android-build, nix run .#android-launch, nix run .#miqt-docker"
+          printf '%s\n' "Available commands: nix run .#run, nix run .#desktop-build, nix run .#android-build, nix run .#miqt-docker, nix run .#miqt-rcc"
         '';
       };
     };
