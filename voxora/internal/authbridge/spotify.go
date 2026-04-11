@@ -3,9 +3,13 @@ package authbridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -28,11 +32,17 @@ type SpotifyBridge struct {
 	trackPageLimit  int
 	trackItems      []libspotdl.LibraryTrackSummary
 	loadingTracks   bool
+
+	downloadedByURI map[string]string
+}
+
+type downloadedTrackIndex struct {
+	Tracks map[string]string `json:"tracks"`
 }
 
 func NewSpotifyBridge() *SpotifyBridge {
 	props := qml.NewQQmlPropertyMap()
-	b := &SpotifyBridge{props: props}
+	b := &SpotifyBridge{props: props, downloadedByURI: make(map[string]string)}
 
 	b.set("state", "idle")
 	b.set("statusText", "Spotify auth: idle")
@@ -74,6 +84,8 @@ func NewSpotifyBridge() *SpotifyBridge {
 			b.set("trackListStatus", "")
 		}
 	})
+
+	b.loadDownloadedIndex()
 
 	go b.bootstrapExistingAuth()
 
@@ -394,12 +406,12 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 	b.loadingTracks = false
 	b.mu.Unlock()
 
-	tracksJSON := "[]"
-	if encoded, encErr := json.Marshal(allTracks); encErr == nil {
-		tracksJSON = string(encoded)
-	}
+	allTracks = b.annotateDownloadedTracks(allTracks)
+	b.mu.Lock()
+	b.trackItems = append([]libspotdl.LibraryTrackSummary(nil), allTracks...)
+	b.mu.Unlock()
 
-	b.set("trackListJson", tracksJSON)
+	b.publishTrackList(allTracks)
 	b.set("trackHasMore", page.HasMore)
 	b.set("trackTotal", page.Total)
 	loadedCount := len(allTracks)
@@ -425,6 +437,175 @@ func defaultDownloadDir() string {
 		return filepath.Join(home, "Music", "Voxora")
 	}
 	return ""
+}
+
+func downloadIndexPath() string {
+	configDir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(configDir) == "" {
+		return ""
+	}
+	return filepath.Join(configDir, "voxora", "downloaded_tracks.json")
+}
+
+var trackURIRegex = regexp.MustCompile(`spotify:track:[A-Za-z0-9]+`)
+
+func extractTrackURIFromMediaTags(filePath string) string {
+	cmd := exec.Command(
+		"ffprobe",
+		"-v", "error",
+		"-show_entries", "format_tags=comment,description",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		filePath,
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	match := trackURIRegex.FindString(string(out))
+	return strings.TrimSpace(match)
+}
+
+func isScannableAudioFile(path string) bool {
+	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(path)))
+	switch ext {
+	case ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".wav", ".opus":
+		return true
+	default:
+		return false
+	}
+}
+
+func scanDownloadedAudioTags(downloadDir string) map[string]string {
+	result := make(map[string]string)
+	dir := strings.TrimSpace(downloadDir)
+	if dir == "" {
+		return result
+	}
+
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !isScannableAudioFile(path) {
+			return nil
+		}
+
+		uri := extractTrackURIFromMediaTags(path)
+		if uri == "" {
+			return nil
+		}
+		result[uri] = path
+		return nil
+	})
+
+	return result
+}
+
+func (b *SpotifyBridge) loadDownloadedIndex() {
+	path := downloadIndexPath()
+	clean := make(map[string]string)
+	if strings.TrimSpace(path) != "" {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			var idx downloadedTrackIndex
+			if json.Unmarshal(raw, &idx) == nil {
+				for uri, filePath := range idx.Tracks {
+					u := strings.TrimSpace(uri)
+					p := strings.TrimSpace(filePath)
+					if u == "" || p == "" {
+						continue
+					}
+					if _, statErr := os.Stat(p); statErr == nil {
+						clean[u] = p
+					}
+				}
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			// ignore malformed/unreadable index and continue with disk scan.
+		}
+	}
+
+	for uri, filePath := range scanDownloadedAudioTags(defaultDownloadDir()) {
+		clean[uri] = filePath
+	}
+
+	b.mu.Lock()
+	b.downloadedByURI = clean
+	b.mu.Unlock()
+
+	_ = b.saveDownloadedIndex()
+}
+
+func (b *SpotifyBridge) saveDownloadedIndex() error {
+	path := downloadIndexPath()
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	copyMap := make(map[string]string, len(b.downloadedByURI))
+	for uri, filePath := range b.downloadedByURI {
+		copyMap[uri] = filePath
+	}
+	b.mu.Unlock()
+
+	encoded, err := json.MarshalIndent(downloadedTrackIndex{Tracks: copyMap}, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, encoded, 0o644)
+}
+
+func (b *SpotifyBridge) annotateDownloadedTracks(items []libspotdl.LibraryTrackSummary) []libspotdl.LibraryTrackSummary {
+	b.mu.Lock()
+	index := make(map[string]string, len(b.downloadedByURI))
+	for uri, filePath := range b.downloadedByURI {
+		index[uri] = filePath
+	}
+	b.mu.Unlock()
+
+	out := make([]libspotdl.LibraryTrackSummary, 0, len(items))
+	missing := make([]string, 0)
+	for _, item := range items {
+		marked := item
+		if p, ok := index[item.URI]; ok {
+			if _, err := os.Stat(p); err == nil {
+				marked.Downloaded = true
+				marked.DownloadedPath = p
+			} else {
+				marked.Downloaded = false
+				marked.DownloadedPath = ""
+				missing = append(missing, item.URI)
+			}
+		}
+		out = append(out, marked)
+	}
+
+	if len(missing) > 0 {
+		b.mu.Lock()
+		for _, uri := range missing {
+			delete(b.downloadedByURI, uri)
+		}
+		b.mu.Unlock()
+		_ = b.saveDownloadedIndex()
+	}
+	return out
+}
+
+func (b *SpotifyBridge) publishTrackList(items []libspotdl.LibraryTrackSummary) {
+	tracksJSON := "[]"
+	if encoded, encErr := json.Marshal(items); encErr == nil {
+		tracksJSON = string(encoded)
+	}
+	b.set("trackListJson", tracksJSON)
 }
 
 func (b *SpotifyBridge) downloadTrack(raw string) {
@@ -504,6 +685,23 @@ func (b *SpotifyBridge) downloadTrack(raw string) {
 
 	b.set("isDownloadingTrack", false)
 	if len(results) > 0 && strings.TrimSpace(results[0].OutputPath) != "" {
+		downloadedPath := strings.TrimSpace(results[0].OutputPath)
+		b.mu.Lock()
+		if b.downloadedByURI == nil {
+			b.downloadedByURI = make(map[string]string)
+		}
+		b.downloadedByURI[trackURI] = downloadedPath
+		for i := range b.trackItems {
+			if b.trackItems[i].URI == trackURI {
+				b.trackItems[i].Downloaded = true
+				b.trackItems[i].DownloadedPath = downloadedPath
+				break
+			}
+		}
+		updatedTracks := append([]libspotdl.LibraryTrackSummary(nil), b.trackItems...)
+		b.mu.Unlock()
+		_ = b.saveDownloadedIndex()
+		b.publishTrackList(updatedTracks)
 		b.set("trackListStatus", "Downloaded \""+trackName+"\" to "+results[0].OutputPath)
 		return
 	}

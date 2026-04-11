@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Controls
+import QtMultimedia
 import QtQuick.Window
 
 Window {
@@ -9,6 +10,32 @@ Window {
 
     title: "Voxora"
     color: "#0f1115"
+    property string currentPlayingPath: ""
+
+    function toFileUrl(path) {
+        if (!path) {
+            return ""
+        }
+        if (path.startsWith("file://")) {
+            return path
+        }
+        return "file://" + path
+    }
+
+    AudioOutput {
+        id: localAudioOutput
+        volume: 0.8
+    }
+
+    MediaPlayer {
+        id: localPlayer
+        audioOutput: localAudioOutput
+        onPlaybackStateChanged: {
+            if (playbackState === MediaPlayer.StoppedState) {
+                currentPlayingPath = ""
+            }
+        }
+    }
 
     property var playlistsData: {
         try {
@@ -226,7 +253,7 @@ Window {
                         spacing: 8
 
                         Column {
-                            width: Math.max(120, parent.width - 120)
+                            width: Math.max(120, parent.width - 260)
                             spacing: 2
 
                             Text {
@@ -248,6 +275,27 @@ Window {
                             text: spotifyAuthBridge.isDownloadingTrack ? "Downloading..." : "Download"
                             enabled: !spotifyAuthBridge.isDownloadingTrack
                             onClicked: spotifyAuthBridge.downloadTrackRequest = (modelData.URI || "") + "\n" + (modelData.Name || "Track") + "\n" + Date.now()
+                        }
+
+                        Button {
+                            text: "Play"
+                            visible: !!modelData.DownloadedPath
+                            enabled: !!modelData.DownloadedPath
+                            onClicked: {
+                                currentPlayingPath = modelData.DownloadedPath || ""
+                                localPlayer.source = toFileUrl(currentPlayingPath)
+                                localPlayer.play()
+                            }
+                        }
+
+                        Button {
+                            text: "Stop"
+                            visible: !!modelData.DownloadedPath
+                            enabled: (currentPlayingPath === (modelData.DownloadedPath || "")) && localPlayer.playbackState !== MediaPlayer.StoppedState
+                            onClicked: {
+                                localPlayer.stop()
+                                currentPlayingPath = ""
+                            }
                         }
                     }
                 }
@@ -278,6 +326,20 @@ Window {
                               : (trackListData.length + " tracks")
                         color: "#8ea4c2"
                         verticalAlignment: Text.AlignVCenter
+                    }
+
+                    Text {
+                        text: "Volume"
+                        color: "#8ea4c2"
+                        verticalAlignment: Text.AlignVCenter
+                    }
+
+                    Slider {
+                        width: 140
+                        from: 0
+                        to: 1
+                        value: localAudioOutput.volume
+                        onValueChanged: localAudioOutput.volume = value
                     }
                 }
             }

@@ -183,9 +183,11 @@ type LibrarySnapshot struct {
 // LibraryTrackSummary is a compact display model for one track in a playlist
 // or collection view.
 type LibraryTrackSummary struct {
-	URI        string
-	Name       string
-	ArtistText string
+	URI            string
+	Name           string
+	ArtistText     string
+	Downloaded     bool
+	DownloadedPath string
 }
 
 // LibraryTrackPage is a paged slice of context tracks for incremental loading.
