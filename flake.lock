@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "miqtSrc": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1774284393,
+        "narHash": "sha256-VQRLEVSmhtSEL9TcLx776VC4j3LFYfDm/s62FVJ/pG0=",
+        "owner": "rcalixte",
+        "repo": "miqt",
+        "rev": "b0b6e229fba3b24ec1dd15be7f28aabca2b524e0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rcalixte",
+        "ref": "qt_611",
+        "repo": "miqt",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1775710090,
+        "narHash": "sha256-ar3rofg+awPB8QXDaFJhJ2jJhu+KqN/PRCXeyuXR76E=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "4c1018dae018162ec878d42fec712642d214fdfa",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "miqtSrc": "miqtSrc",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

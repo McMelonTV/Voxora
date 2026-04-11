@@ -1,0 +1,45 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Nix
+.direnv/
+result
+
+# JetBrains
+.idea/*
+!.idea/runConfigurations/
+.idea/runConfigurations/**
+!.idea/runConfigurations/**/
+!.idea/runConfigurations/**/*.xml
+*.iml
+
+# Go build/test artifacts
+bin/
+dist/
+*.test
+*.out
+coverage.out
+
+# Environment and local secrets
+*.env
+*.env.*
+!.env.example
+!.env.template
+*.keystore
+*.jks
+
+# Android/Gradle outputs
+**/.gradle/
+**/build/
+**/captures/
+**/local.properties
+*.apk
+*.aab
+*.idsig
+
+# Qt Android deployment-generated files
+voxora/deployment-settings.json
+
+# Ignore generated Android project tree entirely
+voxora/android-build/
