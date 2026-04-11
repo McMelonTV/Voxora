@@ -96,6 +96,15 @@
         src = miqtSrc;
         subPackages = [ "cmd/miqt-docker" ];
         vendorHash = null;
+        nativeBuildInputs = [ pkgs.gnused ];
+        postPatch = ''
+          script=cmd/miqt-docker/android-build.sh
+
+          sed -i 's/^\([[:space:]]*\)echo Qt6Widgets[[:space:]]*$/\1echo Qt6Widgets\n\1echo Qt6Gui\n\1echo Qt6Qml\n\1echo Qt6Quick/' "$script"
+          sed -i '/plugins\/platforms -lplugins_platforms_qtforandroid_arm64-v8a/d' "$script"
+
+          grep -n 'echo Qt6Gui\|echo Qt6Qml\|echo Qt6Quick\|plugins_platforms_qtforandroid' "$script"
+        '';
       };
 
       miqtRcc = pkgs.buildGoModule {
@@ -152,6 +161,25 @@
           ${androidEnv}
 
           cd "$PWD/voxora"
+
+          if [ -f "deployment-settings.json" ]; then
+            qtTargetPath="$(sed -n 's/^[[:space:]]*"qt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' deployment-settings.json | head -n 1)"
+            if [ -n "$qtTargetPath" ] && [[ "$qtTargetPath" == */android_* ]]; then
+              qtRoot="''${qtTargetPath%/android_*}"
+              qtHostPath="$qtRoot/gcc_64"
+
+              # Ensure host-side Qt tools are discoverable for androiddeployqt.
+              export QT_HOST_PATH="$qtHostPath"
+              export QT_HOST_BINS="$qtHostPath/bin"
+              export PATH="$qtHostPath/libexec:$qtHostPath/bin:$PATH"
+
+              # Keep QML/plugin discovery deterministic inside containerized builds.
+              export QML2_IMPORT_PATH="$qtTargetPath/qml:$qtHostPath/qml''${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
+              export QT_PLUGIN_PATH="$qtTargetPath/plugins:$qtHostPath/plugins''${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+              export QT_QPA_PLATFORM_PLUGIN_PATH="$qtTargetPath/plugins/platforms"
+            fi
+          fi
+
           exec miqt-docker android-qt6 -android-build "$@"
         '';
       };
