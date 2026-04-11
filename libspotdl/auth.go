@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	librespot "github.com/devgianlu/go-librespot"
 	devicespb "github.com/devgianlu/go-librespot/proto/spotify/connectstate/devices"
@@ -31,6 +33,32 @@ type credentialCache struct {
 type spotifyTokenAuth struct {
 	Username string
 	Token    string
+}
+
+// InteractiveAuthStart contains the browser URL and flow handle for
+// application-driven OAuth login.
+type InteractiveAuthStart struct {
+	AuthURL      string
+	CallbackPort int
+	Flow         *InteractiveAuthFlow
+}
+
+// InteractiveAuthResult is the final result for an OAuth flow.
+type InteractiveAuthResult struct {
+	Username string
+	Token    string
+}
+
+// InteractiveAuthFlow represents one pending OAuth browser flow.
+type InteractiveAuthFlow struct {
+	cancel context.CancelFunc
+	result chan interactiveAuthOutcome
+	once   sync.Once
+}
+
+type interactiveAuthOutcome struct {
+	result InteractiveAuthResult
+	err    error
 }
 
 func defaultCredentialsFile() (string, error) {
@@ -149,11 +177,32 @@ func withSessionTroubleshooting(err error) error {
 }
 
 func acquireInteractiveSpotifyToken(ctx context.Context, log librespot.Logger, callbackPort int) (*spotifyTokenAuth, error) {
+	start, err := StartInteractiveAuthFlow(ctx, log, callbackPort)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Infof("to complete authentication visit the following link: %s", start.AuthURL)
+
+	result, err := start.Flow.Wait(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &spotifyTokenAuth{
+		Username: result.Username,
+		Token:    result.Token,
+	}, nil
+}
+
+// StartInteractiveAuthFlow starts an OAuth callback server and returns a URL the
+// caller should open in a browser.
+func StartInteractiveAuthFlow(parent context.Context, log librespot.Logger, callbackPort int) (*InteractiveAuthStart, error) {
 	serverCtx, serverCancel := context.WithCancel(context.Background())
-	defer serverCancel()
 
 	callbackPort, codeCh, err := librespotsession.NewOAuth2Server(serverCtx, log, callbackPort)
 	if err != nil {
+		serverCancel()
 		return nil, fmt.Errorf("failed initializing oauth2 server: %w", err)
 	}
 
@@ -166,32 +215,109 @@ func acquireInteractiveSpotifyToken(ctx context.Context, log librespot.Logger, c
 
 	verifier := oauth2.GenerateVerifier()
 	authURL := oauthConf.AuthCodeURL("", oauth2.S256ChallengeOption(verifier))
-	log.Infof("to complete authentication visit the following link: %s", authURL)
 
-	var code string
+	flow := &InteractiveAuthFlow{
+		cancel: serverCancel,
+		result: make(chan interactiveAuthOutcome, 1),
+	}
+
+	go func() {
+		defer serverCancel()
+
+		var outcome interactiveAuthOutcome
+
+		var code string
+		select {
+		case <-parent.Done():
+			outcome.err = parent.Err()
+		case code = <-codeCh:
+			if strings.TrimSpace(code) == "" {
+				outcome.err = errors.New("spotify oauth callback returned no authorization code")
+				break
+			}
+
+			token, err := oauthConf.Exchange(parent, code, oauth2.VerifierOption(verifier))
+			if err != nil {
+				outcome.err = fmt.Errorf("failed exchanging oauth2 code: %w", err)
+				break
+			}
+
+			username, _ := token.Extra("username").(string)
+			accessToken := strings.TrimSpace(token.AccessToken)
+			if accessToken == "" {
+				outcome.err = errors.New("spotify oauth token response did not include an access token")
+				break
+			}
+
+			outcome.result = InteractiveAuthResult{
+				Username: strings.TrimSpace(username),
+				Token:    accessToken,
+			}
+		}
+
+		flow.result <- outcome
+		close(flow.result)
+	}()
+
+	return &InteractiveAuthStart{
+		AuthURL:      authURL,
+		CallbackPort: callbackPort,
+		Flow:         flow,
+	}, nil
+}
+
+// Wait blocks until the flow succeeds, fails, or ctx is canceled.
+func (f *InteractiveAuthFlow) Wait(ctx context.Context) (InteractiveAuthResult, error) {
+	if f == nil {
+		return InteractiveAuthResult{}, errors.New("nil interactive auth flow")
+	}
+
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
-	case code = <-codeCh:
+		f.Cancel()
+		return InteractiveAuthResult{}, ctx.Err()
+	case outcome, ok := <-f.result:
+		if !ok {
+			return InteractiveAuthResult{}, errors.New("interactive auth flow ended unexpectedly")
+		}
+		return outcome.result, outcome.err
 	}
-	if strings.TrimSpace(code) == "" {
-		return nil, errors.New("spotify oauth callback returned no authorization code")
+}
+
+// Cancel cancels the callback server and pending waiters.
+func (f *InteractiveAuthFlow) Cancel() {
+	if f == nil || f.cancel == nil {
+		return
+	}
+	f.once.Do(f.cancel)
+}
+
+// PersistInteractiveAuthResult exchanges an OAuth token for stored credentials
+// and writes them to the configured credentials cache.
+func PersistInteractiveAuthResult(ctx context.Context, cfg Config, result InteractiveAuthResult) error {
+	cfg.Auth.IgnoreStoredCredentials = true
+	cfg.Auth.AccessToken = strings.TrimSpace(result.Token)
+	if cfg.Auth.AccessToken == "" {
+		return errors.New("empty spotify access token")
+	}
+	cfg.Auth.Username = strings.TrimSpace(result.Username)
+
+	log := cfg.Logger
+	if log == nil {
+		log = newDefaultLogger()
 	}
 
-	token, err := oauthConf.Exchange(ctx, code, oauth2.VerifierOption(verifier))
+	client := cfg.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+
+	sess, err := newAuthenticatedSession(ctx, cfg, log, client)
 	if err != nil {
-		return nil, fmt.Errorf("failed exchanging oauth2 code: %w", err)
+		return err
 	}
-
-	username, _ := token.Extra("username").(string)
-	username = strings.TrimSpace(username)
-
-	accessToken := strings.TrimSpace(token.AccessToken)
-	if accessToken == "" {
-		return nil, errors.New("spotify oauth token response did not include an access token")
-	}
-
-	return &spotifyTokenAuth{Username: username, Token: accessToken}, nil
+	sess.Close()
+	return nil
 }
 
 func resolveSessionCredentials(ctx context.Context, cfg Config, log librespot.Logger, client *http.Client, deviceID string, cache *credentialCache) (any, error) {

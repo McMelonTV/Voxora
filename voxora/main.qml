@@ -8,6 +8,7 @@ Window {
     visible: true
 
     title: "Voxora"
+    color: "#0f1115"
 
     Column {
         anchors.fill: parent
@@ -40,6 +41,23 @@ Window {
                     text: "Renderer: " + graphicsRenderer
                     color: "#d7d7d7"
                     wrapMode: Text.WrapAnywhere
+                }
+
+                Row {
+                    spacing: 8
+
+                    Button {
+                        text: spotifyAuthBridge.isBusy ? "Authenticating..." : "Connect Spotify"
+                        enabled: !spotifyAuthBridge.isBusy
+                        onClicked: spotifyAuthBridge.startAuthNonce = Date.now()
+                    }
+
+                    Text {
+                        text: spotifyAuthBridge.statusText
+                        color: "#9ad0ff"
+                        wrapMode: Text.WrapAnywhere
+                        width: Math.max(120, infoColumn.width - 170)
+                    }
                 }
             }
         }
