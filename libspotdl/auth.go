@@ -28,6 +28,7 @@ type credentialCache struct {
 	DeviceID          string `json:"device_id"`
 	Username          string `json:"username"`
 	StoredCredentials string `json:"stored_credentials"`
+	OAuthAccessToken  string `json:"oauth_access_token,omitempty"`
 }
 
 type spotifyTokenAuth struct {
@@ -62,6 +63,21 @@ type interactiveAuthOutcome struct {
 }
 
 var ErrNoStoredCredentials = errors.New("no stored spotify credentials found")
+var ErrNoCachedOAuthAccessToken = errors.New("no cached spotify oauth access token found")
+
+func spotifyOAuthClientID() string {
+	if configured := strings.TrimSpace(os.Getenv("SPOTIFY_WEB_API_CLIENT_ID")); configured != "" {
+		return configured
+	}
+	if configured := strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_ID")); configured != "" {
+		return configured
+	}
+	return librespot.ClientIdHex
+}
+
+func usingDefaultSpotifyOAuthClientID() bool {
+	return spotifyOAuthClientID() == librespot.ClientIdHex
+}
 
 func defaultCredentialsFile() (string, error) {
 	configDir, err := os.UserConfigDir()
@@ -139,11 +155,49 @@ func loadCredentialCache(path string) (*credentialCache, error) {
 }
 
 func saveCredentialCache(path, deviceID string, sess *librespotsession.Session) error {
+	existing, err := loadCredentialCache(path)
+	if err != nil {
+		return err
+	}
+
+	oauthAccessToken := ""
+	if existing != nil {
+		oauthAccessToken = strings.TrimSpace(existing.OAuthAccessToken)
+	}
+
 	cache := credentialCache{
 		DeviceID:          deviceID,
 		Username:          sess.Username(),
 		StoredCredentials: base64.StdEncoding.EncodeToString(sess.StoredCredentials()),
+		OAuthAccessToken:  oauthAccessToken,
 	}
+
+	data, err := json.MarshalIndent(cache, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode credentials cache: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create credentials cache dir: %w", err)
+	}
+
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write credentials cache: %w", err)
+	}
+
+	return nil
+}
+
+func saveOAuthAccessToken(path, accessToken string) error {
+	cache, err := loadCredentialCache(path)
+	if err != nil {
+		return err
+	}
+	if cache == nil {
+		cache = &credentialCache{}
+	}
+
+	cache.OAuthAccessToken = strings.TrimSpace(accessToken)
 
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
@@ -209,10 +263,15 @@ func StartInteractiveAuthFlow(parent context.Context, log librespot.Logger, call
 	}
 
 	oauthConf := &oauth2.Config{
-		ClientID:    librespot.ClientIdHex,
+		ClientID:    spotifyOAuthClientID(),
 		RedirectURL: fmt.Sprintf("http://127.0.0.1:%d/login", callbackPort),
-		Scopes:      []string{"streaming"},
-		Endpoint:    spotifyoauth2.Endpoint,
+		Scopes: []string{
+			"streaming",
+			"playlist-read-private",
+			"playlist-read-collaborative",
+			"user-library-read",
+		},
+		Endpoint: spotifyoauth2.Endpoint,
 	}
 
 	verifier := oauth2.GenerateVerifier()
@@ -319,7 +378,41 @@ func PersistInteractiveAuthResult(ctx context.Context, cfg Config, result Intera
 		return err
 	}
 	sess.Close()
+
+	credentialsFile, err := resolveCredentialsFile(cfg.Auth.CredentialsFile)
+	if err != nil {
+		return err
+	}
+
+	if err := saveOAuthAccessToken(credentialsFile, result.Token); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// CachedOAuthAccessToken returns the cached OAuth access token from the
+// credentials cache file.
+func CachedOAuthAccessToken(credentialsFile string) (string, error) {
+	resolved, err := resolveCredentialsFile(credentialsFile)
+	if err != nil {
+		return "", err
+	}
+
+	cache, err := loadCredentialCache(resolved)
+	if err != nil {
+		return "", err
+	}
+	if cache == nil {
+		return "", ErrNoCachedOAuthAccessToken
+	}
+
+	token := strings.TrimSpace(cache.OAuthAccessToken)
+	if token == "" {
+		return "", ErrNoCachedOAuthAccessToken
+	}
+
+	return token, nil
 }
 
 // TryStoredCredentialsSession attempts to authenticate using only cached
@@ -379,6 +472,25 @@ func TryStoredCredentialsSession(ctx context.Context, cfg Config) error {
 	}
 	sess.Close()
 	return nil
+}
+
+// HasStoredCredentials returns whether a usable stored-credentials cache is
+// present. It does not perform network calls or authenticate.
+func HasStoredCredentials(credentialsFile string) (bool, error) {
+	resolved, err := resolveCredentialsFile(credentialsFile)
+	if err != nil {
+		return false, err
+	}
+
+	cache, err := loadCredentialCache(resolved)
+	if err != nil {
+		return false, err
+	}
+	if cache == nil {
+		return false, nil
+	}
+
+	return strings.TrimSpace(cache.Username) != "" && strings.TrimSpace(cache.StoredCredentials) != "", nil
 }
 
 // IsSpotifyCredentialRefusedError returns true when an auth failure appears to

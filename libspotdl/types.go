@@ -152,3 +152,47 @@ type Result struct {
 	OutputFormat OutputFormat
 	Metadata     MediaMetadata
 }
+
+// UserPlaylistSummary describes one playlist from the authenticated account.
+type UserPlaylistSummary struct {
+	ID          string
+	URI         string
+	Name        string
+	Description string
+	OwnerName   string
+	TrackCount  int
+	ImageURL    string
+	Public      bool
+}
+
+// LikedSongsSummary describes the account's "Liked Songs" collection.
+type LikedSongsSummary struct {
+	URI        string
+	Name       string
+	TrackCount int
+}
+
+// LibrarySnapshot contains account playlist data and liked songs summary loaded
+// from one authenticated session.
+type LibrarySnapshot struct {
+	Playlists      []UserPlaylistSummary
+	Liked          LikedSongsSummary
+	LikedAvailable bool
+}
+
+// LibraryTrackSummary is a compact display model for one track in a playlist
+// or collection view.
+type LibraryTrackSummary struct {
+	URI        string
+	Name       string
+	ArtistText string
+}
+
+// LibraryTrackPage is a paged slice of context tracks for incremental loading.
+type LibraryTrackPage struct {
+	Items   []LibraryTrackSummary
+	Offset  int
+	Limit   int
+	Total   int
+	HasMore bool
+}
