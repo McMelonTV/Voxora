@@ -19,4 +19,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/devgianlu/go-librespot => ../third_party/go-librespot
+// replace github.com/devgianlu/go-librespot => ./../third_party/go-librespot

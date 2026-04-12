@@ -111,21 +111,12 @@ func ResolveCredentialsFile(path string) (string, error) {
 }
 
 func randomDeviceID() (string, error) {
-	buf := make([]byte, 16)
+	buf := make([]byte, 20)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generate device id: %w", err)
 	}
 
-	buf[6] = (buf[6] & 0x0f) | 0x40
-	buf[8] = (buf[8] & 0x3f) | 0x80
-
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		buf[0:4],
-		buf[4:6],
-		buf[6:8],
-		buf[8:10],
-		buf[10:16],
-	), nil
+	return hex.EncodeToString(buf), nil
 }
 
 func isLegacyHexDeviceID(deviceID string) bool {
@@ -437,7 +428,7 @@ func TryStoredCredentialsSession(ctx context.Context, cfg Config) error {
 	}
 
 	deviceID := strings.TrimSpace(cfg.Auth.DeviceID)
-	if deviceID == "" && !isLegacyHexDeviceID(cache.DeviceID) {
+	if deviceID == "" && isLegacyHexDeviceID(cache.DeviceID) {
 		deviceID = strings.TrimSpace(cache.DeviceID)
 	}
 	if deviceID == "" {
@@ -590,7 +581,7 @@ func newAuthenticatedSession(ctx context.Context, cfg Config, log librespot.Logg
 	}
 
 	deviceID := strings.TrimSpace(cfg.Auth.DeviceID)
-	if deviceID == "" && cache != nil && !isLegacyHexDeviceID(cache.DeviceID) {
+	if deviceID == "" && cache != nil && isLegacyHexDeviceID(cache.DeviceID) {
 		deviceID = strings.TrimSpace(cache.DeviceID)
 	}
 	if deviceID == "" {

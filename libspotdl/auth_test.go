@@ -74,15 +74,15 @@ func TestResolveSessionCredentialsAllowsTokenAuthWithoutUsername(t *testing.T) {
 	}
 }
 
-func TestRandomDeviceIDReturnsUUIDLikeValue(t *testing.T) {
+func TestRandomDeviceIDReturnsHexValue(t *testing.T) {
 	deviceID, err := randomDeviceID()
 	if err != nil {
 		t.Fatalf("randomDeviceID returned error: %v", err)
 	}
 
-	pattern := regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+	pattern := regexp.MustCompile(`^[0-9a-f]{40}$`)
 	if !pattern.MatchString(deviceID) {
-		t.Fatalf("randomDeviceID = %q, want UUID-like lowercase hex format", deviceID)
+		t.Fatalf("randomDeviceID = %q, want 40-character lowercase hex format", deviceID)
 	}
 }
 
