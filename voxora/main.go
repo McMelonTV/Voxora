@@ -46,7 +46,7 @@ func androidLibraryDir() string {
 	return ""
 }
 
-func app_main() {
+func main() {
 	fmt.Print("using libvoxora v" + libvoxora.Version())
 
 	runtime.LockOSThread()

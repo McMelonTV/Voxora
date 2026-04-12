@@ -11,6 +11,64 @@ Window {
     title: "Voxora"
     color: "#0f1115"
     property string currentPlayingPath: ""
+    property int lastStreamReadyNonce: 0
+    property bool manualStopRequested: false
+    property bool streamRecovering: false
+    property bool scrubbingActive: false
+    property bool resumeAfterScrub: false
+    property int streamRecoverAttempts: 0
+    property int streamRecoverTargetPositionMs: -1
+    property int streamOpenBufferedBytes: 0
+    property bool streamSourceSwitching: false
+    property bool streamSourceSwitchShouldPlay: false
+    property int expectedDurationMs: 0
+    property int effectiveDurationMs: Math.max(localPlayer.duration, expectedDurationMs)
+    property int pendingResumePositionMs: -1
+    property int pendingSeekTargetMs: -1
+    property real pendingSeekRatio: -1
+    property int pendingResumeAttempts: 0
+    property real userVolume: 0.8
+    property real playbackProgress: effectiveDurationMs > 0 ? Math.max(0, Math.min(1, localPlayer.position / effectiveDurationMs)) : 0
+    property bool usingStreamSource: currentPlayingPath.length > 0 && currentPlayingPath === (spotifyAuthBridge.streamPlayPath || "")
+    property real bufferedProgressLatched: 0
+    property real streamFetchProgress: {
+        var total = Number(spotifyAuthBridge.streamBufferedTotal)
+        var have = Number(spotifyAuthBridge.streamBufferedBytes)
+        if (!isNaN(total) && !isNaN(have) && total > 0) {
+            return Math.max(0, Math.min(1, have / total))
+        }
+        return -1
+    }
+    property real bufferedProgress: {
+        var raw = 0
+        if (usingStreamSource) {
+            raw = Math.max(bufferedProgressLatched, streamFetchProgress)
+        } else {
+            raw = Math.max(bufferedProgressLatched, Number(localPlayer.bufferProgress))
+        }
+        if (isNaN(raw)) {
+            raw = 0
+        }
+        raw = Math.max(0, Math.min(1, raw))
+        return Math.max(playbackProgress, raw)
+    }
+
+    onStreamFetchProgressChanged: {
+        if (streamFetchProgress >= 0) {
+            bufferedProgressLatched = Math.max(bufferedProgressLatched, streamFetchProgress)
+        }
+    }
+
+    Connections {
+        target: localPlayer
+        function onBufferProgressChanged() {
+            var raw = Number(localPlayer.bufferProgress)
+            if (!isNaN(raw)) {
+                raw = Math.max(0, Math.min(1, raw))
+                bufferedProgressLatched = Math.max(bufferedProgressLatched, raw)
+            }
+        }
+    }
 
     function toFileUrl(path) {
         if (!path) {
@@ -22,17 +80,261 @@ Window {
         return "file://" + path
     }
 
+    function formatMs(ms) {
+        var totalSec = Math.max(0, Math.floor((ms || 0) / 1000))
+        var m = Math.floor(totalSec / 60)
+        var s = totalSec % 60
+        return m + ":" + (s < 10 ? "0" + s : s)
+    }
+
+    function recoverStreamingPlayback() {
+        if (manualStopRequested || streamRecovering) {
+            return
+        }
+
+        var targetPath = currentPlayingPath || ""
+        if (targetPath.length === 0) {
+            return
+        }
+
+        streamRecovering = true
+        streamRecoverAttempts += 1
+        streamRecoverTargetPositionMs = Math.max(0, localPlayer.position)
+
+        // Never reopen source here; keep continuous reader handle to avoid audible gaps.
+        var currentSource = localPlayer.source ? localPlayer.source.toString() : ""
+        var targetSource = toFileUrl(targetPath)
+        var isLiveFifo = targetPath.endsWith(".live.fifo")
+        if (currentSource.length === 0 && targetSource.length > 0) {
+            localPlayer.source = targetSource
+        }
+
+        if (!isLiveFifo && streamRecoverTargetPositionMs >= 0) {
+            pendingResumePositionMs = streamRecoverTargetPositionMs
+            pendingSeekRatio = -1
+            pendingSeekTargetMs = -1
+            pendingResumeAttempts = 0
+        }
+        recoverStreamingTimer.restart()
+    }
+
+    function seekToX(mouseX, trackWidth) {
+        if (trackWidth <= 0) {
+            return
+        }
+        var ratio = mouseX / trackWidth
+        ratio = Math.max(0, Math.min(1, ratio))
+        seekToRatio(ratio)
+    }
+
+    function seekToRatio(ratio) {
+        if (effectiveDurationMs <= 0) {
+            return
+        }
+        ratio = Math.max(0, Math.min(1, ratio))
+        var targetPos = Math.floor(effectiveDurationMs * ratio)
+
+        if (currentPlayingPath.endsWith(".live.fifo")) {
+            var cachedPath = spotifyAuthBridge.streamCachePath || ""
+            var have = Number(spotifyAuthBridge.streamBufferedBytes)
+            var total = Number(spotifyAuthBridge.streamBufferedTotal)
+            var canSeekInCache = spotifyAuthBridge.streamCacheReady && cachedPath.length > 0
+            if (canSeekInCache && !isNaN(have) && !isNaN(total) && total > 0) {
+                var bufferedRatio = Math.max(0, Math.min(1, have / total))
+                canSeekInCache = ratio <= Math.max(0, bufferedRatio - 0.01)
+            }
+            if (canSeekInCache) {
+                streamSourceSwitching = true
+                streamSourceSwitchShouldPlay = localPlayer.playbackState === MediaPlayer.PlayingState
+                pendingSeekRatio = ratio
+                pendingResumePositionMs = targetPos
+                pendingResumeAttempts = 0
+                currentPlayingPath = cachedPath
+                localPlayer.source = toFileUrl(cachedPath)
+            } else {
+                spotifyAuthBridge.trackListStatus = "Seek target not buffered yet"
+            }
+            return
+        }
+
+        localPlayer.position = targetPos
+        pendingSeekRatio = ratio
+        pendingResumePositionMs = targetPos
+        pendingResumeAttempts = 0
+        resumeSeekTimer.restart()
+    }
+
+    function togglePlayPause() {
+        if (!localPlayer.source || localPlayer.source.toString().length === 0) {
+            return
+        }
+        if (localPlayer.playbackState === MediaPlayer.PlayingState) {
+            localPlayer.pause()
+        } else {
+            localPlayer.play()
+        }
+    }
+
+    function applyPendingResume() {
+        if (pendingResumePositionMs < 0 && pendingSeekRatio < 0) {
+            return
+        }
+        var baseDuration = effectiveDurationMs
+        var target = pendingResumePositionMs
+        if (pendingSeekRatio >= 0 && baseDuration > 0) {
+            target = Math.floor(baseDuration * pendingSeekRatio)
+        }
+        var maxPos = baseDuration > 1000 ? (baseDuration - 250) : target
+        target = Math.max(0, Math.min(target, maxPos))
+
+        var readyForSeek = localPlayer.seekable || (localPlayer.duration > 0 && !currentPlayingPath.endsWith(".live.fifo"))
+        if (readyForSeek) {
+            localPlayer.position = target
+            pendingSeekTargetMs = target
+        }
+
+        pendingResumeAttempts += 1
+        if (pendingResumeAttempts > 60) {
+            pendingResumePositionMs = -1
+            pendingSeekTargetMs = -1
+            pendingSeekRatio = -1
+            pendingResumeAttempts = 0
+            resumeSeekTimer.stop()
+        }
+    }
+
     AudioOutput {
         id: localAudioOutput
-        volume: 0.8
+        volume: userVolume
+
+        Behavior on volume {
+            NumberAnimation {
+                duration: 90
+                easing.type: Easing.InOutQuad
+            }
+        }
     }
 
     MediaPlayer {
         id: localPlayer
         audioOutput: localAudioOutput
+        onMediaStatusChanged: {
+            if (streamSourceSwitching && (mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia || mediaStatus === MediaPlayer.BufferingMedia)) {
+                var target = Math.max(0, pendingResumePositionMs)
+                localPlayer.position = target
+                pendingSeekTargetMs = target
+                pendingResumeAttempts = 0
+                if (streamSourceSwitchShouldPlay) {
+                    localPlayer.play()
+                }
+                streamSourceSwitching = false
+                streamSourceSwitchShouldPlay = false
+                resumeSeekTimer.restart()
+            }
+            applyPendingResume()
+        }
+        onPositionChanged: {
+            if (pendingSeekTargetMs >= 0) {
+                if (Math.abs(localPlayer.position - pendingSeekTargetMs) <= 1500) {
+                    pendingResumePositionMs = -1
+                    pendingSeekTargetMs = -1
+                    pendingSeekRatio = -1
+                    pendingResumeAttempts = 0
+                    resumeSeekTimer.stop()
+                }
+            }
+        }
         onPlaybackStateChanged: {
+            if (playbackState === MediaPlayer.PlayingState) {
+                streamRecovering = false
+                streamRecoverAttempts = 0
+                streamRecoverTargetPositionMs = -1
+            }
+
             if (playbackState === MediaPlayer.StoppedState) {
+                if (streamSourceSwitching) {
+                    return
+                }
+                var cachePath = spotifyAuthBridge.streamCachePath || ""
+                var bufferedNow = Number(spotifyAuthBridge.streamBufferedBytes) || 0
+                var likelyNaturalEnd = effectiveDurationMs > 0 && localPlayer.position >= (effectiveDurationMs - 1500)
+                var isPotentialStreamStop = currentPlayingPath.length > 0 && (
+                    currentPlayingPath.endsWith(".live.fifo")
+                    || (cachePath.length > 0 && currentPlayingPath === cachePath)
+                    || (spotifyAuthBridge.streamPlayPath || "") === currentPlayingPath
+                )
+                var hasNewBufferedData = bufferedNow > (streamOpenBufferedBytes + 8192)
+                var stillDownloading = !!spotifyAuthBridge.isStreamingTrack
+                var recoverableStop = !likelyNaturalEnd && (currentPlayingPath.endsWith(".live.fifo") || hasNewBufferedData || stillDownloading)
+
+                if (!manualStopRequested && !streamRecovering && isPotentialStreamStop && recoverableStop && streamRecoverAttempts < 6) {
+                    recoverStreamingPlayback()
+                    return
+                }
+
                 currentPlayingPath = ""
+                manualStopRequested = false
+                streamRecovering = false
+                streamRecoverAttempts = 0
+                streamRecoverTargetPositionMs = -1
+                streamSourceSwitching = false
+                streamSourceSwitchShouldPlay = false
+            }
+        }
+    }
+
+    Timer {
+        id: resumeSeekTimer
+        interval: 120
+        repeat: true
+        running: false
+        onTriggered: applyPendingResume()
+    }
+
+    Timer {
+        id: recoverStreamingTimer
+        interval: 180
+        repeat: false
+        onTriggered: {
+            if (!streamRecovering || manualStopRequested) {
+                streamRecovering = false
+                return
+            }
+            localPlayer.play()
+            if (!currentPlayingPath.endsWith(".live.fifo") && streamRecoverTargetPositionMs >= 0) {
+                pendingResumePositionMs = streamRecoverTargetPositionMs
+                pendingSeekRatio = -1
+                pendingSeekTargetMs = -1
+                pendingResumeAttempts = 0
+                resumeSeekTimer.restart()
+            }
+        }
+    }
+
+    Timer {
+        interval: 200
+        running: true
+        repeat: true
+        onTriggered: {
+            if (spotifyAuthBridge.streamPlayReadyNonce > lastStreamReadyNonce) {
+                lastStreamReadyNonce = spotifyAuthBridge.streamPlayReadyNonce
+                var nextPath = spotifyAuthBridge.streamPlayPath || ""
+                currentPlayingPath = nextPath
+                if (nextPath.length > 0) {
+                    manualStopRequested = false
+                    streamRecovering = false
+                    streamRecoverAttempts = 0
+                    streamRecoverTargetPositionMs = -1
+                    pendingResumePositionMs = -1
+                    pendingSeekTargetMs = -1
+                    pendingSeekRatio = -1
+                    pendingResumeAttempts = 0
+                    resumeSeekTimer.stop()
+                    streamOpenBufferedBytes = Number(spotifyAuthBridge.streamBufferedBytes) || 0
+                    bufferedProgressLatched = 0
+                    localPlayer.source = toFileUrl(nextPath)
+                    localPlayer.play()
+                }
             }
         }
     }
@@ -214,10 +516,114 @@ Window {
                 padding: 8
             }
 
+            Rectangle {
+                width: parent.width
+                height: 52
+                color: "#0f1520"
+                border.color: "#223148"
+                border.width: 1
+
+                Row {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    spacing: 10
+
+                    Button {
+                        width: 86
+                        text: localPlayer.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
+                        enabled: localPlayer.source && localPlayer.source.toString().length > 0
+                        onClicked: togglePlayPause()
+                    }
+
+                    Column {
+                        width: Math.max(120, parent.width - 96)
+                        spacing: 5
+
+                        Rectangle {
+                            id: progressTrack
+                            width: parent.width
+                            height: 14
+                            radius: 7
+                            color: "#182232"
+
+                            Rectangle {
+                                width: parent.width * bufferedProgress
+                                height: parent.height
+                                radius: 7
+                                color: "#5f7391"
+                            }
+
+                            Rectangle {
+                                width: parent.width * playbackProgress
+                                height: parent.height
+                                radius: 7
+                                color: "#9ad0ff"
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                anchors.margins: -10
+                                onPressed: function(mouse) {
+                                    scrubbingActive = true
+                                    resumeAfterScrub = localPlayer.playbackState === MediaPlayer.PlayingState
+                                    if (resumeAfterScrub) {
+                                        localPlayer.pause()
+                                    }
+                                    seekToX(mouse.x, progressTrack.width)
+                                }
+                                onPositionChanged: function(mouse) {
+                                    if (mouse.buttons & Qt.LeftButton) {
+                                        seekToX(mouse.x, progressTrack.width)
+                                    }
+                                }
+                                onReleased: {
+                                    scrubbingActive = false
+                                    if (resumeAfterScrub) {
+                                        localPlayer.play()
+                                    }
+                                    resumeAfterScrub = false
+                                }
+                                onCanceled: {
+                                    scrubbingActive = false
+                                    if (resumeAfterScrub) {
+                                        localPlayer.play()
+                                    }
+                                    resumeAfterScrub = false
+                                }
+                                cursorShape: Qt.PointingHandCursor
+                            }
+                        }
+
+                        Row {
+                            width: parent.width
+
+                            Text {
+                                id: leftTime
+                                text: formatMs(localPlayer.position)
+                                color: "#8ea4c2"
+                                font.pixelSize: 11
+                            }
+
+                            Item {
+                                width: Math.max(0, parent.width - leftTime.width - rightTime.width)
+                                height: 1
+                            }
+
+                            Text {
+                                id: rightTime
+                                text: formatMs(effectiveDurationMs)
+                                color: "#8ea4c2"
+                                font.pixelSize: 11
+                            }
+                        }
+                    }
+                }
+            }
+
             ListView {
                 id: trackListView
                 width: parent.width
-                height: parent.height - 148
+                height: parent.height - 200
                 clip: true
                 model: trackListData
                 property int autoLoadIssuedForCount: -1
@@ -279,22 +685,41 @@ Window {
 
                         Button {
                             text: "Play"
-                            visible: !!modelData.DownloadedPath
-                            enabled: !!modelData.DownloadedPath
+                            enabled: modelData.DownloadedPath ? true : !spotifyAuthBridge.isStreamingTrack
                             onClicked: {
-                                currentPlayingPath = modelData.DownloadedPath || ""
-                                localPlayer.source = toFileUrl(currentPlayingPath)
-                                localPlayer.play()
+                                manualStopRequested = true
+                                streamRecovering = false
+                                streamRecoverAttempts = 0
+                                streamRecoverTargetPositionMs = -1
+                                pendingResumePositionMs = -1
+                                pendingSeekTargetMs = -1
+                                pendingSeekRatio = -1
+                                pendingResumeAttempts = 0
+                                resumeSeekTimer.stop()
+                                localPlayer.stop()
+                                spotifyAuthBridge.clearStreamNonce = Date.now()
+                                manualStopRequested = false
+                                if (modelData.DownloadedPath) {
+                                    expectedDurationMs = modelData.DurationMs || 0
+                                    currentPlayingPath = modelData.DownloadedPath || ""
+                                    localPlayer.source = toFileUrl(currentPlayingPath)
+                                    localPlayer.play()
+                                } else {
+                                    expectedDurationMs = modelData.DurationMs || 0
+                                    spotifyAuthBridge.streamTrackRequest = (modelData.URI || "") + "\n" + (modelData.Name || "Track") + "\n" + Date.now()
+                                }
                             }
                         }
 
                         Button {
                             text: "Stop"
-                            visible: !!modelData.DownloadedPath
-                            enabled: (currentPlayingPath === (modelData.DownloadedPath || "")) && localPlayer.playbackState !== MediaPlayer.StoppedState
+                            enabled: localPlayer.playbackState !== MediaPlayer.StoppedState
                             onClicked: {
+                                manualStopRequested = true
                                 localPlayer.stop()
                                 currentPlayingPath = ""
+                                expectedDurationMs = 0
+                                spotifyAuthBridge.clearStreamNonce = Date.now()
                             }
                         }
                     }
@@ -338,8 +763,13 @@ Window {
                         width: 140
                         from: 0
                         to: 1
-                        value: localAudioOutput.volume
-                        onValueChanged: localAudioOutput.volume = value
+                        value: userVolume
+                        onValueChanged: userVolume = value
+                    }
+
+                    Button {
+                        text: "Clear Stream Cache"
+                        onClicked: spotifyAuthBridge.clearStreamCacheAllNonce = Date.now()
                     }
                 }
             }

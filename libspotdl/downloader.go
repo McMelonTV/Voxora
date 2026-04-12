@@ -212,6 +212,71 @@ func (d *Downloader) Download(ctx context.Context, req Request) ([]Result, error
 	return results, nil
 }
 
+// StreamTrack writes one track's raw source stream sequentially to all provided
+// writers, preserving byte order for live playback pipelines.
+func (d *Downloader) StreamTrack(ctx context.Context, uri string, writers []io.Writer, progress func(Progress)) (MediaMetadata, int64, error) {
+	if strings.TrimSpace(uri) == "" {
+		return MediaMetadata{}, 0, errors.New("empty track uri")
+	}
+	if len(writers) == 0 {
+		return MediaMetadata{}, 0, errors.New("no stream writers provided")
+	}
+
+	id, err := librespot.SpotifyIdFromUri(uri)
+	if err != nil {
+		return MediaMetadata{}, 0, fmt.Errorf("parse track uri %s: %w", uri, err)
+	}
+
+	selected, err := d.prepareDownload(ctx, *id, ItemKindTrack)
+	if err != nil {
+		return MediaMetadata{}, 0, fmt.Errorf("prepare %s: %w", uri, err)
+	}
+	selected.metadata.URI = uri
+
+	stream, totalBytes, err := d.openRawStream(ctx, selected)
+	if err != nil {
+		return MediaMetadata{}, 0, fmt.Errorf("open raw stream: %w", err)
+	}
+	defer stream.Close()
+
+	emitProgress(progress, Progress{
+		URI:        uri,
+		Kind:       ItemKindTrack,
+		ItemIndex:  0,
+		ItemCount:  1,
+		Stage:      "downloading",
+		TotalBytes: totalBytes,
+	})
+
+	multi := io.MultiWriter(writers...)
+	written, err := copyWithProgress(ctx, multi, stream, func(written int64) {
+		emitProgress(progress, Progress{
+			URI:          uri,
+			Kind:         ItemKindTrack,
+			ItemIndex:    0,
+			ItemCount:    1,
+			Stage:        "downloading",
+			BytesWritten: written,
+			TotalBytes:   totalBytes,
+		})
+	})
+	if err != nil {
+		return MediaMetadata{}, written, err
+	}
+
+	emitProgress(progress, Progress{
+		URI:          uri,
+		Kind:         ItemKindTrack,
+		ItemIndex:    0,
+		ItemCount:    1,
+		Stage:        "completed",
+		BytesWritten: written,
+		TotalBytes:   totalBytes,
+	})
+
+	return selected.metadata, written, nil
+}
+
 func (d *Downloader) downloadOne(ctx context.Context, item ResolvedItem, itemCount int, req Request) (Result, error) {
 	id, err := librespot.SpotifyIdFromUri(item.URI)
 	if err != nil {

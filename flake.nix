@@ -27,6 +27,7 @@
       qtPackages = with pkgs.qt6; [
         qtbase
         qtdeclarative
+        qtmultimedia
         qtsvg
       ];
       qtToolPath = lib.concatStringsSep ":" [
@@ -46,10 +47,12 @@
       qtPluginPath = lib.concatStringsSep ":" [
         "${pkgs.qt6.qtbase}/lib/qt-6/plugins"
         "${pkgs.qt6.qtdeclarative}/lib/qt-6/plugins"
+        "${pkgs.qt6.qtmultimedia}/lib/qt-6/plugins"
         "${pkgs.qt6.qtsvg}/lib/qt-6/plugins"
       ];
       qmlImportPath = lib.concatStringsSep ":" [
         "${pkgs.qt6.qtdeclarative}/lib/qt-6/qml"
+        "${pkgs.qt6.qtmultimedia}/lib/qt-6/qml"
         "${pkgs.qt6.qtsvg}/lib/qt-6/qml"
       ];
       pkgConfigPath = lib.makeSearchPath "lib/pkgconfig" qtPackages;
@@ -100,10 +103,10 @@
         postPatch = ''
           script=cmd/miqt-docker/android-build.sh
 
-          sed -i 's/^\([[:space:]]*\)echo Qt6Widgets[[:space:]]*$/\1echo Qt6Widgets\n\1echo Qt6Gui\n\1echo Qt6Qml\n\1echo Qt6Quick/' "$script"
+          sed -i 's/^\([[:space:]]*\)echo Qt6Widgets[[:space:]]*$/\1echo Qt6Widgets\n\1echo Qt6Gui\n\1echo Qt6Qml\n\1echo Qt6Quick\n\1echo Qt6Multimedia/' "$script"
           sed -i '/plugins\/platforms -lplugins_platforms_qtforandroid_arm64-v8a/d' "$script"
 
-          grep -n 'echo Qt6Gui\|echo Qt6Qml\|echo Qt6Quick\|plugins_platforms_qtforandroid' "$script"
+          grep -n 'echo Qt6Gui\|echo Qt6Qml\|echo Qt6Quick\|echo Qt6Multimedia\|plugins_platforms_qtforandroid' "$script"
         '';
       };
 

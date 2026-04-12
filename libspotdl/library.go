@@ -234,6 +234,7 @@ func resolveTrackSummariesBatch(ctx context.Context, sess *librespotsession.Sess
 				}
 			}
 			summary.ArtistText = strings.Join(artists, ", ")
+			summary.DurationMs = int64(meta.GetDuration())
 			summaries[uri] = summary
 		}
 	}

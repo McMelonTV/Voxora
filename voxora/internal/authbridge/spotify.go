@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	libspotdl "github.com/McMelonTV/Voxora/libspotd"
@@ -33,7 +36,18 @@ type SpotifyBridge struct {
 	trackItems      []libspotdl.LibraryTrackSummary
 	loadingTracks   bool
 
-	downloadedByURI map[string]string
+	downloadedByURI  map[string]string
+	currentStream    string
+	streamReadyNonce int
+	streamCancel     context.CancelFunc
+	streamOpID       int
+
+	transferMu           sync.Mutex
+	sharedDownloader     *libspotdl.Downloader
+	sharedCredsFile      string
+	activeStreamFIFO     string
+	activeStreamWrite    *os.File
+	streamBufferedLatest int64
 }
 
 type downloadedTrackIndex struct {
@@ -64,6 +78,16 @@ func NewSpotifyBridge() *SpotifyBridge {
 	b.set("trackTotal", 0)
 	b.set("isDownloadingTrack", false)
 	b.set("downloadTrackRequest", "")
+	b.set("isStreamingTrack", false)
+	b.set("streamTrackRequest", "")
+	b.set("streamPlayPath", "")
+	b.set("streamPlayReadyNonce", 0)
+	b.set("streamCacheReady", false)
+	b.set("streamCachePath", "")
+	b.set("streamBufferedBytes", int64(0))
+	b.set("streamBufferedTotal", int64(0))
+	b.set("clearStreamNonce", 0)
+	b.set("clearStreamCacheAllNonce", 0)
 	b.set("openCollectionRequest", "")
 	b.set("loadMoreTracksNonce", 0)
 	b.set("navigateBackNonce", 0)
@@ -79,6 +103,12 @@ func NewSpotifyBridge() *SpotifyBridge {
 			go b.loadMoreTracks()
 		case "downloadTrackRequest":
 			go b.downloadTrack(value.ToString())
+		case "streamTrackRequest":
+			go b.streamTrack(value.ToString())
+		case "clearStreamNonce":
+			go b.clearStreamCache()
+		case "clearStreamCacheAllNonce":
+			go b.clearAllStreamCache()
 		case "navigateBackNonce":
 			b.set("viewMode", "library")
 			b.set("trackListStatus", "")
@@ -107,6 +137,23 @@ func (b *SpotifyBridge) Close() {
 		b.flowCancel()
 		b.flowCancel = nil
 		b.flowCtx = nil
+	}
+	if b.streamCancel != nil {
+		b.streamCancel()
+		b.streamCancel = nil
+	}
+	if strings.TrimSpace(b.activeStreamFIFO) != "" {
+		_ = os.Remove(b.activeStreamFIFO)
+		b.activeStreamFIFO = ""
+	}
+	if b.activeStreamWrite != nil {
+		_ = b.activeStreamWrite.Close()
+		b.activeStreamWrite = nil
+	}
+	if b.sharedDownloader != nil {
+		_ = b.sharedDownloader.Close()
+		b.sharedDownloader = nil
+		b.sharedCredsFile = ""
 	}
 }
 
@@ -180,6 +227,7 @@ func (b *SpotifyBridge) startFlow() {
 	b.flowCtx = nil
 	b.flowCancel = nil
 	b.mu.Unlock()
+	b.resetSharedDownloader()
 
 	b.set("isBusy", false)
 	b.set("state", "completed")
@@ -439,6 +487,540 @@ func defaultDownloadDir() string {
 	return ""
 }
 
+func streamFIFOPathForURI(uri string) string {
+	return filepath.Join(streamCacheDir(), sanitizeTrackID(uri)+".live.fifo")
+}
+
+func (b *SpotifyBridge) resetSharedDownloader() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.sharedDownloader != nil {
+		_ = b.sharedDownloader.Close()
+		b.sharedDownloader = nil
+		b.sharedCredsFile = ""
+	}
+}
+
+func (b *SpotifyBridge) sharedDownloaderFor(ctx context.Context) (*libspotdl.Downloader, error) {
+	credentialsFile, err := libspotdl.ResolveCredentialsFile("")
+	if err != nil {
+		return nil, err
+	}
+
+	b.mu.Lock()
+	if b.sharedDownloader != nil && b.sharedCredsFile == credentialsFile {
+		d := b.sharedDownloader
+		b.mu.Unlock()
+		return d, nil
+	}
+	old := b.sharedDownloader
+	b.sharedDownloader = nil
+	b.sharedCredsFile = ""
+	b.mu.Unlock()
+
+	if old != nil {
+		_ = old.Close()
+	}
+
+	d, err := libspotdl.New(ctx, libspotdl.Config{Auth: libspotdl.AuthConfig{CredentialsFile: credentialsFile}})
+	if err != nil {
+		return nil, err
+	}
+
+	b.mu.Lock()
+	if b.sharedDownloader != nil {
+		existing := b.sharedDownloader
+		b.mu.Unlock()
+		_ = d.Close()
+		return existing, nil
+	}
+	b.sharedDownloader = d
+	b.sharedCredsFile = credentialsFile
+	b.mu.Unlock()
+
+	return d, nil
+}
+
+func streamCacheDir() string {
+	cacheDir, err := os.UserCacheDir()
+	if err == nil && strings.TrimSpace(cacheDir) != "" {
+		return filepath.Join(cacheDir, "voxora", "stream")
+	}
+	return filepath.Join(os.TempDir(), "voxora", "stream")
+}
+
+const (
+	streamCacheReadyBytes = int64(32 * 1024)
+	streamCacheMinFree    = uint64(1024 * 1024 * 1024) // 1 GiB
+)
+
+type cachedStreamFile struct {
+	path    string
+	modTime time.Time
+	size    int64
+}
+
+func streamCachePathForURI(uri string) string {
+	return filepath.Join(streamCacheDir(), sanitizeTrackID(uri)+".stream.ogg")
+}
+
+func isUsableCachedStream(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		return false
+	}
+	return info.Size() >= streamCacheReadyBytes
+}
+
+func freeDiskBytes(path string) uint64 {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0
+	}
+	return stat.Bavail * uint64(stat.Bsize)
+}
+
+func listStreamCacheFiles(dir string) []cachedStreamFile {
+	out := make([]cachedStreamFile, 0, 64)
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(d.Name()), ".stream.ogg") {
+			return nil
+		}
+		info, statErr := d.Info()
+		if statErr != nil {
+			return nil
+		}
+		out = append(out, cachedStreamFile{path: path, modTime: info.ModTime(), size: info.Size()})
+		return nil
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].modTime.Before(out[j].modTime) })
+	return out
+}
+
+func (b *SpotifyBridge) pruneStreamCacheIfLowDisk(cacheDir string) {
+	cacheDir = strings.TrimSpace(cacheDir)
+	if cacheDir == "" {
+		return
+	}
+	free := freeDiskBytes(cacheDir)
+	if free >= streamCacheMinFree {
+		return
+	}
+
+	b.mu.Lock()
+	active := strings.TrimSpace(b.currentStream)
+	b.mu.Unlock()
+
+	files := listStreamCacheFiles(cacheDir)
+	for _, f := range files {
+		if free >= streamCacheMinFree {
+			break
+		}
+		if strings.TrimSpace(f.path) == "" || f.path == active {
+			continue
+		}
+		if err := os.Remove(f.path); err != nil {
+			continue
+		}
+		free = freeDiskBytes(cacheDir)
+	}
+}
+
+func sanitizeTrackID(uri string) string {
+	id := strings.TrimPrefix(strings.TrimSpace(uri), "spotify:track:")
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return "track"
+	}
+	return id
+}
+
+func (b *SpotifyBridge) clearStreamCache() {
+	b.mu.Lock()
+	b.streamOpID++
+	if b.streamCancel != nil {
+		b.streamCancel()
+		b.streamCancel = nil
+	}
+	if b.activeStreamWrite != nil {
+		_ = b.activeStreamWrite.Close()
+		b.activeStreamWrite = nil
+	}
+	fifoPath := strings.TrimSpace(b.activeStreamFIFO)
+	b.activeStreamFIFO = ""
+	b.currentStream = ""
+	b.mu.Unlock()
+
+	if fifoPath != "" {
+		_ = os.Remove(fifoPath)
+	}
+
+	b.set("streamPlayPath", "")
+	b.set("streamCacheReady", false)
+	b.set("streamCachePath", "")
+	b.mu.Lock()
+	b.streamBufferedLatest = 0
+	b.mu.Unlock()
+	b.set("streamBufferedBytes", int64(0))
+	b.set("streamBufferedTotal", int64(0))
+}
+
+func (b *SpotifyBridge) clearAllStreamCache() {
+	b.clearStreamCache()
+
+	cacheDir := strings.TrimSpace(streamCacheDir())
+	if cacheDir == "" {
+		b.set("trackListStatus", "Stream cache cleared")
+		return
+	}
+
+	removed := 0
+	_ = filepath.WalkDir(cacheDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		name := strings.ToLower(d.Name())
+		if strings.HasSuffix(name, ".stream.ogg") || strings.HasSuffix(name, ".live.fifo") {
+			if remErr := os.Remove(path); remErr == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+
+	b.set("trackListStatus", fmt.Sprintf("Cleared %d stream cache file(s)", removed))
+}
+
+func (b *SpotifyBridge) streamTrack(raw string) {
+	parts := strings.SplitN(raw, "\n", 3)
+	if len(parts) < 1 {
+		return
+	}
+
+	trackURI := strings.TrimSpace(parts[0])
+	trackName := "Track"
+	if len(parts) >= 2 {
+		if name := strings.TrimSpace(parts[1]); name != "" {
+			trackName = name
+		}
+	}
+
+	if !strings.HasPrefix(trackURI, "spotify:track:") {
+		b.set("lastError", "invalid track uri")
+		b.set("trackListStatus", "Failed starting stream")
+		return
+	}
+
+	b.clearStreamCache()
+	b.mu.Lock()
+	b.streamOpID++
+	opID := b.streamOpID
+	b.mu.Unlock()
+
+	b.set("isStreamingTrack", true)
+	b.set("lastError", "")
+	b.set("trackListStatus", "Buffering \""+trackName+"\"...")
+	b.set("streamCacheReady", false)
+	b.set("streamCachePath", "")
+	b.mu.Lock()
+	b.streamBufferedLatest = 0
+	b.mu.Unlock()
+	b.set("streamBufferedBytes", int64(0))
+	b.set("streamBufferedTotal", int64(0))
+
+	cacheDir := streamCacheDir()
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		b.set("isStreamingTrack", false)
+		b.set("lastError", err.Error())
+		b.set("trackListStatus", "Stream failed")
+		return
+	}
+	b.pruneStreamCacheIfLowDisk(cacheDir)
+
+	outputPath := streamCachePathForURI(trackURI)
+	if isUsableCachedStream(outputPath) {
+		_ = os.Chtimes(outputPath, time.Now(), time.Now())
+		if info, statErr := os.Stat(outputPath); statErr == nil {
+			b.mu.Lock()
+			b.streamBufferedLatest = info.Size()
+			b.mu.Unlock()
+			b.set("streamBufferedBytes", info.Size())
+			b.set("streamBufferedTotal", info.Size())
+		}
+		b.mu.Lock()
+		if b.streamOpID == opID {
+			b.currentStream = outputPath
+			b.streamReadyNonce++
+			nonce := b.streamReadyNonce
+			b.mu.Unlock()
+			b.set("streamPlayPath", outputPath)
+			b.set("streamPlayReadyNonce", nonce)
+			b.set("streamCacheReady", true)
+			b.set("streamCachePath", outputPath)
+			b.set("isStreamingTrack", false)
+			b.set("trackListStatus", "Playing cached stream \""+trackName+"\"")
+			return
+		}
+		b.mu.Unlock()
+		b.set("isStreamingTrack", false)
+		return
+	}
+
+	fifoPath := streamFIFOPathForURI(trackURI)
+	_ = os.Remove(fifoPath)
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		b.set("isStreamingTrack", false)
+		b.set("lastError", err.Error())
+		b.set("trackListStatus", "Stream failed")
+		return
+	}
+
+	b.mu.Lock()
+	b.activeStreamFIFO = fifoPath
+	if b.streamOpID == opID {
+		b.streamReadyNonce++
+		nonce := b.streamReadyNonce
+		b.mu.Unlock()
+		b.set("streamPlayPath", fifoPath)
+		b.set("streamPlayReadyNonce", nonce)
+	} else {
+		b.mu.Unlock()
+		_ = os.Remove(fifoPath)
+		b.set("isStreamingTrack", false)
+		return
+	}
+
+	cacheFile, err := os.Create(outputPath)
+	if err != nil {
+		_ = os.Remove(fifoPath)
+		b.set("isStreamingTrack", false)
+		b.set("lastError", err.Error())
+		b.set("trackListStatus", "Stream failed")
+		return
+	}
+	defer cacheFile.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+
+	b.mu.Lock()
+	b.streamCancel = cancel
+	b.currentStream = outputPath
+	b.mu.Unlock()
+
+	downloadDone := make(chan struct{})
+	tailDone := make(chan struct{})
+	go func() {
+		defer close(tailDone)
+
+		fifoWriter, ferr := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+		if ferr != nil {
+			return
+		}
+		defer func() {
+			_ = fifoWriter.Close()
+			b.mu.Lock()
+			if b.activeStreamWrite == fifoWriter {
+				b.activeStreamWrite = nil
+			}
+			b.mu.Unlock()
+		}()
+
+		b.mu.Lock()
+		if b.streamOpID == opID {
+			b.activeStreamWrite = fifoWriter
+		}
+		b.mu.Unlock()
+
+		cacheReader, rerr := os.Open(outputPath)
+		if rerr != nil {
+			return
+		}
+		defer cacheReader.Close()
+
+		buf := make([]byte, 64*1024)
+		downloadFinished := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			n, readErr := cacheReader.Read(buf)
+			if n > 0 {
+				written := 0
+				for written < n {
+					wn, werr := fifoWriter.Write(buf[written:n])
+					if werr != nil {
+						if errors.Is(werr, syscall.EPIPE) {
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(15 * time.Millisecond):
+							}
+							continue
+						}
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(15 * time.Millisecond):
+						}
+						continue
+					}
+					if wn <= 0 {
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(15 * time.Millisecond):
+						}
+						continue
+					}
+					written += wn
+				}
+			}
+
+			if readErr == nil {
+				continue
+			}
+			if !errors.Is(readErr, io.EOF) {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(15 * time.Millisecond):
+				}
+				continue
+			}
+
+			if !downloadFinished {
+				select {
+				case <-downloadDone:
+					downloadFinished = true
+				default:
+				}
+			}
+
+			if downloadFinished {
+				pos, _ := cacheReader.Seek(0, io.SeekCurrent)
+				if info, serr := os.Stat(outputPath); serr == nil && pos >= info.Size() {
+					return
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(15 * time.Millisecond):
+			}
+		}
+	}()
+
+	downloader, err := b.sharedDownloaderFor(ctx)
+	if err != nil {
+		cancel()
+		close(downloadDone)
+		<-tailDone
+		_ = os.Remove(fifoPath)
+		b.set("isStreamingTrack", false)
+		b.set("lastError", err.Error())
+		b.set("trackListStatus", "Stream failed")
+		return
+	}
+
+	b.transferMu.Lock()
+	defer b.transferMu.Unlock()
+
+	readySignaled := false
+	_, _, err = downloader.StreamTrack(ctx, trackURI, []io.Writer{cacheFile}, func(p libspotdl.Progress) {
+		b.mu.Lock()
+		isCurrent := b.streamOpID == opID
+		b.mu.Unlock()
+		if !isCurrent {
+			return
+		}
+
+		if p.Stage == "downloading" {
+			b.mu.Lock()
+			if p.BytesWritten > b.streamBufferedLatest {
+				b.streamBufferedLatest = p.BytesWritten
+			}
+			latest := b.streamBufferedLatest
+			b.mu.Unlock()
+			b.set("streamBufferedBytes", latest)
+			if p.TotalBytes > 0 {
+				b.set("streamBufferedTotal", p.TotalBytes)
+			}
+		}
+
+		if !readySignaled && p.Stage == "downloading" && p.BytesWritten >= streamCacheReadyBytes {
+			readySignaled = true
+			b.set("streamCacheReady", true)
+			b.set("streamCachePath", outputPath)
+			b.set("isStreamingTrack", false)
+			b.set("trackListStatus", "Playing streamed \""+trackName+"\"")
+		}
+	})
+	close(downloadDone)
+	<-tailDone
+	cancel()
+	_ = os.Remove(fifoPath)
+	b.mu.Lock()
+	if b.activeStreamFIFO == fifoPath {
+		b.activeStreamFIFO = ""
+	}
+	b.mu.Unlock()
+	b.mu.Lock()
+	isCurrent := b.streamOpID == opID
+	b.mu.Unlock()
+	if !isCurrent {
+		b.set("isStreamingTrack", false)
+		return
+	}
+	if err != nil {
+		b.set("isStreamingTrack", false)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			b.set("trackListStatus", "Stream stopped")
+			return
+		}
+		b.set("lastError", err.Error())
+		b.set("trackListStatus", "Stream failed")
+		return
+	}
+
+	if !readySignaled {
+		b.set("streamCacheReady", true)
+		b.set("streamCachePath", outputPath)
+	}
+	if info, statErr := os.Stat(outputPath); statErr == nil {
+		b.mu.Lock()
+		b.streamBufferedLatest = info.Size()
+		b.mu.Unlock()
+		b.set("streamBufferedBytes", info.Size())
+		b.set("streamBufferedTotal", info.Size())
+	}
+	b.set("streamCacheReady", true)
+	b.set("streamCachePath", outputPath)
+
+	b.mu.Lock()
+	if b.streamOpID == opID {
+		b.streamCancel = nil
+	}
+	b.mu.Unlock()
+	b.set("isStreamingTrack", false)
+	b.set("trackListStatus", "Playing streamed \""+trackName+"\"")
+}
+
 func downloadIndexPath() string {
 	configDir, err := os.UserConfigDir()
 	if err != nil || strings.TrimSpace(configDir) == "" {
@@ -632,14 +1214,6 @@ func (b *SpotifyBridge) downloadTrack(raw string) {
 	b.set("lastError", "")
 	b.set("trackListStatus", "Downloading \""+trackName+"\"...")
 
-	credentialsFile, err := libspotdl.ResolveCredentialsFile("")
-	if err != nil {
-		b.set("isDownloadingTrack", false)
-		b.set("lastError", err.Error())
-		b.set("trackListStatus", "Download failed")
-		return
-	}
-
 	outDir := defaultDownloadDir()
 	if strings.TrimSpace(outDir) != "" {
 		if err := os.MkdirAll(outDir, 0o755); err != nil {
@@ -653,18 +1227,16 @@ func (b *SpotifyBridge) downloadTrack(raw string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
-	cfg := libspotdl.Config{
-		Auth: libspotdl.AuthConfig{CredentialsFile: credentialsFile},
-	}
-
-	downloader, err := libspotdl.New(ctx, cfg)
+	downloader, err := b.sharedDownloaderFor(ctx)
 	if err != nil {
 		b.set("isDownloadingTrack", false)
 		b.set("lastError", err.Error())
 		b.set("trackListStatus", "Download failed")
 		return
 	}
-	defer downloader.Close()
+
+	b.transferMu.Lock()
+	defer b.transferMu.Unlock()
 
 	results, err := downloader.Download(ctx, libspotdl.Request{
 		Source:       trackURI,
