@@ -49,3 +49,9 @@ voxora/android-project/libs/
 voxora/resources.qrc
 voxora/resources_qrc.go
 voxora/resources_qrc.rcc
+
+# Qt Android deployment-generated files
+voxora/deployment-settings.json
+
+# Ignore generated Android project tree entirely
+voxora/android-build/

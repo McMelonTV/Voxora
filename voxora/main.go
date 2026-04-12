@@ -1,27 +1,95 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 
 	"github.com/McMelonTV/Voxora/libvoxora"
+	"github.com/McMelonTV/Voxora/voxora/internal/authbridge"
 	"github.com/McMelonTV/Voxora/voxora/internal/renderinfo"
 	qt "github.com/mappu/miqt/qt6"
 	"github.com/mappu/miqt/qt6/qml"
 )
 
-func app_main() {
-	fmt.Printf("using libvoxora v" + libvoxora.Version())
+func androidLibraryDir() string {
+	file, err := os.Open("/proc/self/maps")
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
 
-	qt.NewQApplication(os.Args)
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		for _, marker := range []string{
+			"/libplugins_platforms_qtforandroid_",
+			"/libQt6Core_",
+			"/libvoxora_",
+		} {
+			if idx := strings.Index(line, marker); idx != -1 {
+				start := strings.LastIndex(line[:idx], " ")
+				if start == -1 {
+					start = 0
+				}
+				libPath := strings.TrimSpace(line[start:])
+				if libPath != "" {
+					return filepath.Dir(libPath)
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+func app_main() {
+	fmt.Print("using libvoxora v" + libvoxora.Version())
+
+	runtime.LockOSThread()
+
+	androidLibDir := ""
+	if runtime.GOOS == "android" {
+		if libDir := androidLibraryDir(); libDir != "" {
+			androidLibDir = libDir
+			_ = os.Setenv("QT_PLUGIN_PATH", libDir)
+			_ = os.Setenv("QT_QPA_PLATFORM_PLUGIN_PATH", libDir)
+			qt.QCoreApplication_SetLibraryPaths([]string{libDir})
+		}
+	}
+
+	qt.NewQGuiApplication(os.Args)
 
 	engine := qml.NewQQmlApplicationEngine()
-	renderSnapshot := renderinfo.Collect(qt.QGuiApplication_PlatformName())
-	qt.QResource_RegisterResource("assets:/android_rcc_bundle.rcc")
-	engine.AddImportPath("assets:/qml")
-	engine.AddImportPath("qrc:/android_rcc_bundle/qml")
+	if runtime.GOOS == "android" {
+		engine.AddImportPath(":/qt-project.org/imports")
+		engine.AddImportPath("qrc:/qt-project.org/imports")
+		engine.AddImportPath("assets:/qt-project.org/imports")
+		engine.AddImportPath("assets:/qml")
+		if androidLibDir != "" {
+			engine.AddPluginPath(androidLibDir)
+		}
+	}
+
+	renderSnapshot := renderinfo.Snapshot{
+		Platform: qt.QGuiApplication_PlatformName(),
+		API:      "Unknown",
+		Renderer: "Unknown",
+	}
+	if runtime.GOOS != "android" {
+		renderSnapshot = renderinfo.Collect(renderSnapshot.Platform)
+	}
 
 	url := qt.NewQUrl3("qrc:/assets/main.qml")
+	if runtime.GOOS == "android" {
+		qt.QResource_RegisterResource("assets:/android_rcc_bundle.rcc")
+		engine.AddImportPath("assets:/qml")
+		engine.AddImportPath("assets:/qt-project.org/imports")
+		engine.AddImportPath("qrc:/android_rcc_bundle/qml")
+	}
 
 	model := qt.NewQAbstractListModel()
 
@@ -43,12 +111,23 @@ func app_main() {
 		}
 	})
 
+	spotifyBridge := authbridge.NewSpotifyBridge()
+	defer spotifyBridge.Close()
+
 	engine.RootContext().SetContextProperty("myModel", model.QObject)
 	engine.RootContext().SetContextProperty2("graphicsPlatform", qt.NewQVariant14(renderSnapshot.Platform))
 	engine.RootContext().SetContextProperty2("graphicsApi", qt.NewQVariant14(renderSnapshot.API))
 	engine.RootContext().SetContextProperty2("graphicsRenderer", qt.NewQVariant14(renderSnapshot.Renderer))
+	engine.RootContext().SetContextProperty("spotifyAuthBridge", spotifyBridge.Object().QObject)
 
 	engine.Load(url)
-
-	qt.QApplication_Exec()
+	if runtime.GOOS == "android" && len(engine.RootObjects()) == 0 {
+		// Android package layouts vary; fallback to root-level main.qml if assets/ prefix is absent.
+		engine.Load(qt.NewQUrl3("qrc:/main.qml"))
+	}
+	if runtime.GOOS == "android" && len(engine.RootObjects()) == 0 {
+		// Final fallback: load from APK assets copied by android-build.sh.
+		engine.Load(qt.NewQUrl3("assets:/main.qml"))
+	}
+	qt.QGuiApplication_Exec()
 }

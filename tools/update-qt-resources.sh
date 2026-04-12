@@ -30,5 +30,5 @@ fi
   printf '%s\n' '</RCC>'
 } > resources.qrc
 
-miqt-rcc -Qt6 -Input resources.qrc -OutputGo resources_qrc.go -Package main
+miqt-rcc -Qt6 -Input resources.qrc -OutputGo resources_qrc.go -OutputRcc resources_qrc.rcc -Package main
 gofmt -w resources_qrc.go

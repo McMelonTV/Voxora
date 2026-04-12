@@ -177,7 +177,12 @@ prepare_android_project() {
   rm -rf "${android_project_dir}/libs"
   mkdir -p "${android_project_dir}/libs"
   mkdir -p "${android_project_dir}/assets"
-  rm -rf "${android_project_dir}/assets/qml" "${android_project_dir}/assets/android_rcc_bundle" "${android_project_dir}/assets/android_rcc_bundle.rcc" "${android_project_dir}/assets/android_rcc_bundle.qrc"
+  rm -rf "${android_project_dir}/assets/qml" "${android_project_dir}/assets/qt-project.org" "${android_project_dir}/assets/android_rcc_bundle" "${android_project_dir}/assets/android_rcc_bundle.rcc" "${android_project_dir}/assets/android_rcc_bundle.qrc"
+
+  # Ship app-owned assets directly so main.qml can be loaded from assets:/ as a runtime fallback.
+  if [ -d ./assets ]; then
+    cp -LR ./assets/. "${android_project_dir}/assets/"
+  fi
 
   cat > "${android_project_dir}/local.properties" <<EOF
 sdk.dir=${ANDROID_SDK_ROOT}
@@ -291,9 +296,14 @@ seed_qt_runtime_for_abi() {
 bundle_qml_modules() {
   local bundle_dir scanner_output relative_path module_path
 
-  bundle_dir="${android_project_dir}/assets/qml"
+  # Qt on Android resolves built-in modules under qt-project.org/imports.
+  bundle_dir="${android_project_dir}/assets/qt-project.org/imports"
   scanner_output="$(mktemp ./qmlimportscanner.XXXXXX.json)"
   mkdir -p "${bundle_dir}"
+
+  # Copy the full Qt QML module tree to avoid runtime "module ... is not installed"
+  # issues when qmlimportscanner misses transitive module metadata/plugins.
+  cp -LR "${QT_ANDROID}/qml/." "${bundle_dir}/"
 
   "${QT_QML_IMPORTSCANNER}" \
     -rootPath "$(pwd)" \

@@ -26,6 +26,8 @@
       qtPackages = with pkgs.qt6; [
         qtbase
         qtdeclarative
+        qtmultimedia
+        qtquick3d
         qtsvg
       ];
       qtAndroidVersion = "6.10.2";
@@ -46,6 +48,43 @@
           pname = "qt-android-runtime-full-${lib.replaceStrings ["-"] ["_"] abi}";
           version = qtAndroidVersion;
           src = qtAndroidSrc;
+
+          postPatch = ''
+            header="qtmultimedia/src/multimedia/android/qandroidaudiojnitypes_p.h"
+            if [ -f "$header" ] && ! grep -q 'qjnitypes.h' "$header"; then
+              sed -i '/#include <QtCore\/qjniobject.h>/a #include <QtCore\/qjnitypes.h>' "$header"
+            fi
+
+            streamHeader="qtmultimedia/src/multimedia/android/qaaudiostream_p.h"
+            if [ -f "$streamHeader" ] && ! grep -q 'qloggingcategory.h' "$streamHeader"; then
+              sed -i '/#include <QtMultimedia\/qaudioformat.h>/a #include <QtCore\/qloggingcategory.h>' "$streamHeader"
+            fi
+
+            devicesCpp="qtmultimedia/src/multimedia/android/qandroidaudiodevices.cpp"
+            if [ -f "$devicesCpp" ] && ! grep -q 'qcoreapplication_platform.h' "$devicesCpp"; then
+              sed -i '/#include <QtCore\/qjniobject.h>/a #include <QtCore\/qcoreapplication_platform.h>' "$devicesCpp"
+            fi
+
+            utilCpp="qtmultimedia/src/multimedia/android/qandroidaudioutil.cpp"
+            if [ -f "$utilCpp" ] && ! grep -q '^#include <QtCore/qjniobject.h>$' "$utilCpp"; then
+              sed -i '1i #include <QtCore/qjniobject.h>' "$utilCpp"
+            fi
+            if [ -f "$utilCpp" ] && ! grep -q '^#include <QtCore/qjnitypes.h>$' "$utilCpp"; then
+              sed -i '1i #include <QtCore/qjnitypes.h>' "$utilCpp"
+            fi
+            if [ -f "$utilCpp" ] && ! grep -q '^#include <QtCore/qcoreapplication_platform.h>$' "$utilCpp"; then
+              sed -i '1i #include <QtCore/qcoreapplication_platform.h>' "$utilCpp"
+            fi
+            if [ -f "$utilCpp" ] && ! grep -q '^#include <jni.h>$' "$utilCpp"; then
+              sed -i '1i #include <jni.h>' "$utilCpp"
+            fi
+
+            streamCpp="qtmultimedia/src/multimedia/android/qaaudiostream.cpp"
+            if [ -f "$streamCpp" ] && ! grep -q '^#include <QtCore/qcoreapplication_platform.h>$' "$streamCpp"; then
+              sed -i '1i #include <QtCore/qcoreapplication_platform.h>' "$streamCpp"
+            fi
+          '';
+
           nativeBuildInputs = [
             pkgs.bison
             pkgs.cmake
@@ -61,7 +100,6 @@
           ];
           configurePhase = ''
             runHook preConfigure
-
             export ANDROID_SDK_ROOT="${androidSdkRoot}"
             export ANDROID_NDK_ROOT="${androidNdkRoot}"
             export JAVA_HOME="${pkgs.jdk17}"
@@ -78,7 +116,8 @@
               -android-sdk "$ANDROID_SDK_ROOT" \
               -android-ndk "$ANDROID_NDK_ROOT" \
               -android-abis ${abi} \
-              -submodules qtbase,qtdeclarative,qtshadertools,qtsvg,qttranslations \
+              -submodules qtbase,qtdeclarative,qtmultimedia,qtshadertools,qtsvg,qttranslations \
+              -no-pch \
               -release \
               -nomake tests \
               -nomake examples \
@@ -91,6 +130,7 @@
               -DGLESv2_INCLUDE_DIR="${androidSysrootIncludeDir}" \
               -DGLESv2_LIBRARY="${glesv2Library}" \
               -DINPUT_opengl=es2 \
+              -DBUILD_qtquick3d=OFF \
               -DQT_BUILD_TESTS=OFF \
               -DQT_BUILD_EXAMPLES=OFF \
               -DCMAKE_BUILD_TYPE=Release \
@@ -169,10 +209,13 @@
       qtPluginPath = lib.concatStringsSep ":" [
         "${pkgs.qt6.qtbase}/lib/qt-6/plugins"
         "${pkgs.qt6.qtdeclarative}/lib/qt-6/plugins"
+        "${pkgs.qt6.qtmultimedia}/lib/qt-6/plugins"
         "${pkgs.qt6.qtsvg}/lib/qt-6/plugins"
       ];
       qmlImportPath = lib.concatStringsSep ":" [
         "${pkgs.qt6.qtdeclarative}/lib/qt-6/qml"
+        "${pkgs.qt6.qtmultimedia}/lib/qt-6/qml"
+        "${pkgs.qt6.qtsvg}/lib/qt-6/qml"
       ];
       libraryPath = lib.makeLibraryPath (qtPackages ++ [ pkgs.stdenv.cc.cc ]);
       commonEnv = ''
@@ -239,6 +282,7 @@
           export PATH="${pkgs.qt6.qtbase}/libexec:$PATH"
         '';
       };
+
       syncQtResources = ''
         bash ${lib.escapeShellArg (toString ./tools/update-qt-resources.sh)} "$PWD/voxora"
       '';
