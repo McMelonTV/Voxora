@@ -34,12 +34,17 @@ coverage.out
 **/build/
 **/captures/
 **/local.properties
+voxora/android-project/assets/
+voxora/android-project/res/values/libs.xml
 *.apk
 *.aab
 *.idsig
 
-# Qt Android deployment-generated files
-voxora/deployment-settings.json
-
-# Ignore generated Android project tree entirely
-voxora/android-build/
+# Qt Android build-generated files
+voxora/.qt-android-runtime/
+voxora/.android-run/
+voxora/.gradle-android/
+voxora/android-project/libs/
+voxora/resources.qrc
+voxora/resources_qrc.go
+voxora/resources_qrc.rcc

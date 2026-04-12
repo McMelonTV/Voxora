@@ -10,15 +10,18 @@ import (
 	"github.com/mappu/miqt/qt6/qml"
 )
 
-func main() {
+func app_main() {
 	fmt.Printf("using libvoxora v" + libvoxora.Version())
 
 	qt.NewQApplication(os.Args)
 
 	engine := qml.NewQQmlApplicationEngine()
 	renderSnapshot := renderinfo.Collect(qt.QGuiApplication_PlatformName())
+	qt.QResource_RegisterResource("assets:/android_rcc_bundle.rcc")
+	engine.AddImportPath("assets:/qml")
+	engine.AddImportPath("qrc:/android_rcc_bundle/qml")
 
-	url := qt.QUrl_FromLocalFile("main.qml")
+	url := qt.NewQUrl3("qrc:/assets/main.qml")
 
 	model := qt.NewQAbstractListModel()
 
