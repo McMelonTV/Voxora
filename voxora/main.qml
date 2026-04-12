@@ -27,6 +27,9 @@ Window {
     property int pendingSeekTargetMs: -1
     property real pendingSeekRatio: -1
     property int pendingResumeAttempts: 0
+    property bool restoreTrackListScrollPending: false
+    property real restoreTrackListScrollY: 0
+    property int restoreTrackListScrollAttempts: 0
     property real userVolume: 0.8
     property real playbackProgress: effectiveDurationMs > 0 ? Math.max(0, Math.min(1, localPlayer.position / effectiveDurationMs)) : 0
     property bool usingStreamSource: currentPlayingPath.length > 0 && currentPlayingPath === (spotifyAuthBridge.streamPlayPath || "")
@@ -175,6 +178,29 @@ Window {
         }
     }
 
+    function activeTrackListView() {
+        if (spotifyAuthBridge.viewMode !== "tracks") {
+            return null
+        }
+        if (!contentLoader.item || !contentLoader.item.trackListViewRef) {
+            return null
+        }
+        return contentLoader.item.trackListViewRef
+    }
+
+    function requestLoadMoreTracksPreserveScroll() {
+        if (spotifyAuthBridge.isLoadingTracks || !spotifyAuthBridge.trackHasMore) {
+            return
+        }
+        var lv = activeTrackListView()
+        if (lv) {
+            restoreTrackListScrollY = lv.contentY
+            restoreTrackListScrollPending = true
+            restoreTrackListScrollAttempts = 0
+        }
+        spotifyAuthBridge.loadMoreTracksNonce = Date.now()
+    }
+
     function applyPendingResume() {
         if (pendingResumePositionMs < 0 && pendingSeekRatio < 0) {
             return
@@ -292,6 +318,30 @@ Window {
     }
 
     Timer {
+        id: restoreTrackListScrollTimer
+        interval: 16
+        repeat: true
+        running: false
+        onTriggered: {
+            var lv = activeTrackListView()
+            if (!restoreTrackListScrollPending || !lv) {
+                stop()
+                return
+            }
+
+            var maxY = Math.max(0, lv.contentHeight - lv.height)
+            var targetY = Math.max(0, Math.min(restoreTrackListScrollY, maxY))
+            lv.contentY = targetY
+            restoreTrackListScrollAttempts += 1
+
+            if (Math.abs(lv.contentY - targetY) <= 1 || restoreTrackListScrollAttempts > 12) {
+                restoreTrackListScrollPending = false
+                stop()
+            }
+        }
+    }
+
+    Timer {
         id: recoverStreamingTimer
         interval: 180
         repeat: false
@@ -352,6 +402,12 @@ Window {
             return JSON.parse(spotifyAuthBridge.trackListJson)
         } catch (e) {
             return []
+        }
+    }
+
+    onTrackListDataChanged: {
+        if (restoreTrackListScrollPending) {
+            restoreTrackListScrollTimer.restart()
         }
     }
 
@@ -430,6 +486,7 @@ Window {
             height: parent.height - infoColumn.parent.height
 
             Loader {
+                id: contentLoader
                 anchors.fill: parent
                 sourceComponent: spotifyAuthBridge.viewMode === "tracks" ? trackListComponent : libraryListComponent
             }
@@ -479,6 +536,8 @@ Window {
         id: trackListComponent
 
         Column {
+            id: trackListRoot
+            property alias trackListViewRef: trackListView
             anchors.fill: parent
             spacing: 0
 
@@ -640,7 +699,7 @@ Window {
                     var nearEnd = (contentY + height) >= (contentHeight - prefetchDistance)
                     if (currentCount !== autoLoadIssuedForCount && !spotifyAuthBridge.isLoadingTracks && spotifyAuthBridge.trackHasMore && nearEnd) {
                         autoLoadIssuedForCount = currentCount
-                        spotifyAuthBridge.loadMoreTracksNonce = Date.now()
+                        requestLoadMoreTracksPreserveScroll()
                     }
                 }
 
@@ -742,7 +801,7 @@ Window {
                         text: spotifyAuthBridge.isLoadingTracks ? "Loading..." : "Load More"
                         enabled: !spotifyAuthBridge.isLoadingTracks && spotifyAuthBridge.trackHasMore
                         visible: spotifyAuthBridge.trackHasMore || spotifyAuthBridge.isLoadingTracks
-                        onClicked: spotifyAuthBridge.loadMoreTracksNonce = Date.now()
+                        onClicked: requestLoadMoreTracksPreserveScroll()
                     }
 
                     Text {

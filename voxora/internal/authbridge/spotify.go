@@ -283,19 +283,13 @@ func (b *SpotifyBridge) loadLibrary() {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	credentialsFile, err := libspotdl.ResolveCredentialsFile("")
+	downloader, err := b.sharedDownloaderFor(ctx)
 	if err != nil {
 		b.set("libraryStatus", "Spotify library: failed ("+err.Error()+")")
 		return
 	}
 
-	cfg := libspotdl.Config{
-		Auth: libspotdl.AuthConfig{
-			CredentialsFile: credentialsFile,
-		},
-	}
-
-	snapshot, err := libspotdl.FetchLibrarySnapshot(ctx, cfg)
+	snapshot, err := libspotdl.FetchLibrarySnapshotWithDownloader(ctx, downloader)
 	if err != nil {
 		errText := strings.ToLower(err.Error())
 		if strings.Contains(errText, "no cached spotify oauth access token") || strings.Contains(errText, "status 401") {
@@ -409,7 +403,10 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 		b.set("trackListStatus", "Loading more tracks...")
 	}
 
-	credentialsFile, err := libspotdl.ResolveCredentialsFile("")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	downloader, err := b.sharedDownloaderFor(ctx)
 	if err != nil {
 		b.mu.Lock()
 		b.loadingTracks = false
@@ -420,14 +417,7 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	cfg := libspotdl.Config{
-		Auth: libspotdl.AuthConfig{CredentialsFile: credentialsFile},
-	}
-
-	page, err := libspotdl.FetchContextTrackSummariesPage(ctx, cfg, contextURI, offset, limit)
+	page, err := libspotdl.FetchContextTrackSummariesPageWithDownloader(ctx, downloader, contextURI, offset, limit)
 	if err != nil {
 		b.mu.Lock()
 		b.loadingTracks = false

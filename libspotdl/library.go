@@ -44,6 +44,34 @@ func FetchLibrarySnapshot(ctx context.Context, cfg Config) (LibrarySnapshot, err
 	})
 }
 
+// FetchLibrarySnapshotWithDownloader loads playlists and liked songs summary
+// using an existing Downloader session.
+func FetchLibrarySnapshotWithDownloader(ctx context.Context, d *Downloader) (LibrarySnapshot, error) {
+	if d == nil || d.sess == nil {
+		return LibrarySnapshot{}, errors.New("spotify downloader session is not initialized")
+	}
+
+	playlists, err := fetchUserPlaylistsWithInternal(ctx, d.sess)
+	if err != nil {
+		return LibrarySnapshot{}, err
+	}
+
+	snapshot := LibrarySnapshot{
+		Playlists:      playlists,
+		Liked:          LikedSongsSummary{Name: "Liked Songs"},
+		LikedAvailable: false,
+	}
+
+	liked, err := fetchLikedSongsSummaryWithInternal(ctx, d.sess)
+	if err != nil {
+		return snapshot, nil
+	}
+
+	snapshot.Liked = liked
+	snapshot.LikedAvailable = true
+	return snapshot, nil
+}
+
 // FetchUserPlaylists loads all playlists owned/followed by the authenticated user.
 func FetchUserPlaylists(ctx context.Context, cfg Config) ([]UserPlaylistSummary, error) {
 	snapshot, err := FetchLibrarySnapshot(ctx, cfg)
@@ -107,6 +135,26 @@ func FetchContextTrackSummariesPage(ctx context.Context, cfg Config, contextURI 
 	return withInternalLibrarySession(ctx, cfg, func(ctx context.Context, sess *librespotsession.Session) (LibraryTrackPage, error) {
 		return fetchContextTrackSummariesPageWithInternal(ctx, sess, contextURI, offset, limit)
 	})
+}
+
+// FetchContextTrackSummariesPageWithDownloader resolves a page of track
+// summaries using an existing Downloader session.
+func FetchContextTrackSummariesPageWithDownloader(ctx context.Context, d *Downloader, contextURI string, offset, limit int) (LibraryTrackPage, error) {
+	contextURI = strings.TrimSpace(contextURI)
+	if contextURI == "" {
+		return LibraryTrackPage{}, errors.New("empty context uri")
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 80
+	}
+	if d == nil || d.sess == nil {
+		return LibraryTrackPage{}, errors.New("spotify downloader session is not initialized")
+	}
+
+	return fetchContextTrackSummariesPageWithInternal(ctx, d.sess, contextURI, offset, limit)
 }
 
 func fetchContextTrackSummariesPageWithInternal(ctx context.Context, sess *librespotsession.Session, contextURI string, offset, limit int) (LibraryTrackPage, error) {
