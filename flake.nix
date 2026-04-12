@@ -253,7 +253,7 @@
           ${syncQtResources}
 
           cd "$PWD/voxora"
-          runBin="$(mktemp "$PWD/.voxora-run.XXXXXX")"
+          runBin="$(mktemp)"
           trap 'rm -f "$runBin"' EXIT
 
           go build -ldflags "-s -w" -o "$runBin" .

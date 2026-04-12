@@ -19,6 +19,7 @@ bin/
 dist/
 *.test
 *.out
+*.tmp
 coverage.out
 
 # Environment and local secrets
