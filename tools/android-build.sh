@@ -390,7 +390,7 @@ bundle_qml_modules() {
 }
 
 generate_libs_xml() {
-  local abi libs_dir qt_name so_name
+  local abi libs_dir qt_name so_name local_chain
   local qt_items=""
   local load_local_items=""
 
@@ -410,8 +410,20 @@ generate_libs_xml() {
     done
     shopt -u nullglob
 
+    local_chain="libplugins_platforms_qtforandroid_${abi}.so"
+    if [ -f "${libs_dir}/libQt6Multimedia_${abi}.so" ]; then
+      local_chain+=":libQt6Multimedia_${abi}.so"
+    fi
+    if [ -f "${libs_dir}/libQt6MultimediaQuick_${abi}.so" ]; then
+      local_chain+=":libQt6MultimediaQuick_${abi}.so"
+    fi
+    if [ -f "${libs_dir}/libplugins_multimedia_androidmediaplugin_${abi}.so" ]; then
+      local_chain+=":libplugins_multimedia_androidmediaplugin_${abi}.so"
+    fi
+    local_chain+=":$(get_go_soname "${abi}")"
+
     load_local_items+=$'\n'
-    load_local_items+="        <item>${abi};libplugins_platforms_qtforandroid_${abi}.so:$(get_go_soname "${abi}")</item>"
+    load_local_items+="        <item>${abi};${local_chain}</item>"
   done
 
   cat > "${android_project_dir}/res/values/libs.xml" <<EOF
