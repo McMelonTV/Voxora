@@ -21,6 +21,8 @@ Window {
     property int streamOpenBufferedBytes: 0
     property bool streamSourceSwitching: false
     property bool streamSourceSwitchShouldPlay: false
+    property int lastPartRefreshAtMs: -1000000
+    property bool partFinalizeRefreshDone: false
     property int expectedDurationMs: 0
     property int effectiveDurationMs: Math.max(localPlayer.duration, expectedDurationMs)
     property int pendingResumePositionMs: -1
@@ -142,6 +144,31 @@ Window {
             }
         }
         recoverStreamingTimer.restart()
+    }
+
+    function refreshPartStreamSource(targetPosMs) {
+        if (streamSourceSwitching) {
+            return
+        }
+        var targetPath = currentPlayingPath || ""
+        if (!targetPath.endsWith(".stream.ogg.part")) {
+            return
+        }
+        var nowMs = Date.now()
+        if ((nowMs - lastPartRefreshAtMs) < 1200) {
+            return
+        }
+        lastPartRefreshAtMs = nowMs
+
+        var wasPlaying = localPlayer.playbackState === MediaPlayer.PlayingState
+        streamSourceSwitching = true
+        streamSourceSwitchShouldPlay = wasPlaying
+        pendingResumePositionMs = Math.max(0, targetPosMs)
+        pendingSeekRatio = -1
+        pendingSeekTargetMs = -1
+        pendingResumeAttempts = 0
+        localPlayer.source = ""
+        localPlayer.source = toFileUrl(targetPath)
     }
 
     function seekToX(mouseX, trackWidth) {
@@ -305,6 +332,21 @@ Window {
             applyPendingResume()
         }
         onPositionChanged: {
+            if (!streamSourceSwitching && !scrubbingActive && currentPlayingPath.endsWith(".stream.ogg.part")) {
+                var total = Number(spotifyAuthBridge.streamBufferedTotal)
+                var have = Number(spotifyAuthBridge.streamBufferedBytes)
+                if (!!spotifyAuthBridge.isStreamingTrack && !isNaN(total) && !isNaN(have) && total > 0 && effectiveDurationMs > 0) {
+                    var bufferedRatio = Math.max(0, Math.min(1, have / total))
+                    var bufferedMs = Math.floor(effectiveDurationMs * bufferedRatio)
+                    if (bufferedMs > 0 && localPlayer.position >= Math.max(0, bufferedMs - 2500)) {
+                        refreshPartStreamSource(localPlayer.position)
+                    }
+                } else if (!spotifyAuthBridge.isStreamingTrack && !partFinalizeRefreshDone && localPlayer.position > 0) {
+                    partFinalizeRefreshDone = true
+                    refreshPartStreamSource(localPlayer.position)
+                }
+            }
+
             if (pendingSeekTargetMs >= 0) {
                 if (Math.abs(localPlayer.position - pendingSeekTargetMs) <= 1500) {
                     pendingResumePositionMs = -1
@@ -426,6 +468,8 @@ Window {
                     pendingSeekRatio = -1
                     pendingResumeAttempts = 0
                     resumeSeekTimer.stop()
+                    lastPartRefreshAtMs = -1000000
+                    partFinalizeRefreshDone = false
                     streamOpenBufferedBytes = Number(spotifyAuthBridge.streamBufferedBytes) || 0
                     bufferedProgressLatched = 0
                     localPlayer.source = ""

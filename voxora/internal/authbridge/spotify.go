@@ -834,7 +834,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	if doneMarkerPath != "" {
 		_ = os.Remove(doneMarkerPath)
 	}
- 	if activeOutputPath != outputPath {
+	if activeOutputPath != outputPath {
 		_ = os.Remove(activeOutputPath)
 	}
 
@@ -884,6 +884,24 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 		b.set("trackListStatus", "Stream failed")
 		return
 	}
+
+	var cacheMirror *os.File
+	streamWriter := io.Writer(cacheFile)
+	if activeOutputPath != outputPath {
+		cacheMirror, err = os.Create(outputPath)
+		if err != nil {
+			_ = cacheFile.Close()
+			if useFIFO {
+				_ = os.Remove(fifoPath)
+			}
+			b.set("isStreamingTrack", false)
+			b.set("lastError", err.Error())
+			b.set("trackListStatus", "Stream failed")
+			return
+		}
+		streamWriter = io.MultiWriter(cacheFile, cacheMirror)
+	}
+
 	cacheFileClosed := false
 	closeCacheFile := func() {
 		if cacheFileClosed {
@@ -891,6 +909,10 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 		}
 		_ = cacheFile.Sync()
 		_ = cacheFile.Close()
+		if cacheMirror != nil {
+			_ = cacheMirror.Sync()
+			_ = cacheMirror.Close()
+		}
 		cacheFileClosed = true
 	}
 	defer closeCacheFile()
@@ -1031,7 +1053,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	defer b.transferMu.Unlock()
 
 	readySignaled := false
-	_, _, err = downloader.StreamTrack(ctx, trackURI, []io.Writer{cacheFile}, func(p libspotdl.Progress) {
+	_, _, err = downloader.StreamTrack(ctx, trackURI, []io.Writer{streamWriter}, func(p libspotdl.Progress) {
 		b.mu.Lock()
 		isCurrent := b.streamOpID == opID
 		b.mu.Unlock()
@@ -1102,41 +1124,23 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	}
 
 	closeCacheFile()
-	if activeOutputPath != outputPath {
-		_ = os.Remove(outputPath)
-		if renErr := os.Rename(activeOutputPath, outputPath); renErr != nil {
-			b.set("isStreamingTrack", false)
-			b.set("lastError", renErr.Error())
-			b.set("trackListStatus", "Stream failed")
-			return
-		}
-	}
 	if doneMarkerPath != "" {
 		_ = os.WriteFile(doneMarkerPath, []byte("ok\n"), 0o644)
 	}
 	if !useFIFO && activeOutputPath != outputPath {
 		b.mu.Lock()
 		if b.streamOpID == opID {
-			b.currentStream = outputPath
-			b.streamReadyNonce++
-			nonce := b.streamReadyNonce
-			b.mu.Unlock()
-			b.set("streamPlayPath", outputPath)
-			b.set("streamPlayReadyNonce", nonce)
-		} else {
-			b.mu.Unlock()
+			b.currentStream = activeOutputPath
 		}
+		b.mu.Unlock()
 	}
 
 	if !readySignaled {
 		if !useFIFO {
 			b.mu.Lock()
 			if b.streamOpID == opID {
-				b.streamReadyNonce++
-				nonce := b.streamReadyNonce
+				b.currentStream = activeOutputPath
 				b.mu.Unlock()
-				b.set("streamPlayPath", outputPath)
-				b.set("streamPlayReadyNonce", nonce)
 			} else {
 				b.mu.Unlock()
 			}
