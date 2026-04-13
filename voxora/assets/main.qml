@@ -1,7 +1,9 @@
 import QtQuick
 import QtQuick.Controls
 import QtMultimedia
+import QtQuick.Shapes
 import QtQuick.Window
+import Qt.labs.settings
 
 Window {
     width: 576
@@ -31,6 +33,22 @@ Window {
     property int loadMoreRequestedForCount: -1
     property real userVolume: 0.8
     property var navigationStack: []
+    property color actionButtonTextColor: "#1f2a38"
+    property color actionButtonTextColorDisabled: "#7d8796"
+    property string currentTrackTitle: ""
+    property string currentTrackArtist: ""
+    property string currentTrackAlbumArtUrl: ""
+    property string currentTrackURI: ""
+    property string currentTrackDownloadedPath: ""
+    property int currentTrackIndex: -1
+    property bool autoplayEnabled: true
+    property bool streamShouldAutoPlay: true
+    property bool holdStoppedTrackState: false
+    property string activeContextURI: ""
+    property string activeContextName: ""
+    property bool restoringSession: false
+    property string resumeTargetTrackURI: ""
+    property int resumeTargetPositionMs: -1
     property real playbackProgress: effectiveDurationMs > 0 ? Math.max(0, Math.min(1, localPlayer.position / effectiveDurationMs)) : 0
     property bool usingStreamSource: currentPlayingPath.length > 0 && currentPlayingPath === (spotifyAuthBridge.streamPlayPath || "")
     property bool streamFullyBuffered: {
@@ -75,9 +93,24 @@ Window {
     }
 
     onClosing: function(close) {
+        if (close.accepted) {
+            persistSessionState()
+        }
         if (handleBackNavigation()) {
             close.accepted = false
         }
+    }
+
+    Settings {
+        id: sessionState
+        category: "playback_session"
+        property string contextURI: ""
+        property string contextName: ""
+        property string trackURI: ""
+        property string trackName: ""
+        property string trackArtist: ""
+        property string albumArtURL: ""
+        property int positionMs: 0
     }
 
     Shortcut {
@@ -272,11 +305,110 @@ Window {
         if (!localPlayer.source || localPlayer.source.toString().length === 0) {
             return
         }
+        holdStoppedTrackState = false
         if (localPlayer.playbackState === MediaPlayer.PlayingState) {
             localPlayer.pause()
         } else {
             localPlayer.play()
         }
+    }
+
+    function startTrackAtIndex(index, shouldPlay) {
+        var count = trackListModel.count
+        if (index < 0 || index >= count) {
+            return
+        }
+
+        var item = trackListModel.get(index)
+        if (!item) {
+            return
+        }
+
+        var trackUri = item.URI || ""
+        var trackName = item.Name || "Track"
+        var artistText = item.ArtistText || ""
+        var downloadedPath = item.DownloadedPath || ""
+        var isDownloaded = downloadedPath.length > 0
+        var durationMs = item.DurationMs || 0
+
+        currentTrackIndex = index
+        currentTrackURI = trackUri
+        currentTrackTitle = trackName || trackUri || "Unknown track"
+        currentTrackArtist = artistText
+        currentTrackAlbumArtUrl = item.AlbumArtURL || ""
+        currentTrackDownloadedPath = downloadedPath
+        persistSessionState()
+
+        holdStoppedTrackState = !shouldPlay
+        streamShouldAutoPlay = shouldPlay
+        manualStopRequested = true
+        streamRecovering = false
+        streamRecoverAttempts = 0
+        streamRecoverTargetPositionMs = -1
+        pendingResumePositionMs = -1
+        pendingSeekTargetMs = -1
+        pendingSeekRatio = -1
+        pendingResumeAttempts = 0
+        resumeSeekTimer.stop()
+        localPlayer.stop()
+        spotifyAuthBridge.clearStreamNonce = Date.now()
+        manualStopRequested = false
+
+        expectedDurationMs = durationMs
+        if (isDownloaded) {
+            currentPlayingPath = downloadedPath
+            localPlayer.source = toFileUrl(currentPlayingPath)
+            if (shouldPlay) {
+                localPlayer.play()
+            }
+            requestNextTrackPrebuffer()
+            return
+        }
+
+        spotifyAuthBridge.streamTrackRequest = trackUri + "\n" + trackName + "\n" + Date.now()
+        requestNextTrackPrebuffer()
+    }
+
+    function requestNextTrackPrebuffer() {
+        if (!autoplayEnabled || trackListModel.count <= 0 || currentTrackIndex < 0) {
+            return
+        }
+        var nextIndex = currentTrackIndex + 1
+        if (nextIndex < 0 || nextIndex >= trackListModel.count) {
+            return
+        }
+        var nextItem = trackListModel.get(nextIndex)
+        if (!nextItem) {
+            return
+        }
+        var downloadedPath = nextItem.DownloadedPath || ""
+        if (downloadedPath.length > 0) {
+            return
+        }
+        var nextURI = nextItem.URI || ""
+        if (nextURI.length === 0) {
+            return
+        }
+        spotifyAuthBridge.prebufferTrackRequest = nextURI + "\n" + (nextItem.Name || "Track") + "\n" + Date.now()
+    }
+
+    function playTrackAtIndex(index) {
+        startTrackAtIndex(index, true)
+    }
+
+    function playAdjacentTrack(step) {
+        if (trackListModel.count <= 0) {
+            return
+        }
+        var start = currentTrackIndex
+        if (start < 0) {
+            start = 0
+        }
+        var next = start + step
+        if (next < 0 || next >= trackListModel.count) {
+            return
+        }
+        playTrackAtIndex(next)
     }
 
     function pushNavigationEntry(entry) {
@@ -290,8 +422,43 @@ Window {
         if (cleanUri.length === 0) {
             return
         }
+        activeContextURI = cleanUri
+        activeContextName = name || "Collection"
         pushNavigationEntry({ fromViewMode: spotifyAuthBridge.viewMode })
         spotifyAuthBridge.openCollectionRequest = cleanUri + "\n" + (name || "Collection") + "\n" + Date.now()
+    }
+
+    function persistSessionState() {
+        if (activeContextURI.length === 0 || currentTrackURI.length === 0) {
+            return
+        }
+        sessionState.contextURI = activeContextURI
+        sessionState.contextName = activeContextName
+        sessionState.trackURI = currentTrackURI
+        sessionState.trackName = currentTrackTitle
+        sessionState.trackArtist = currentTrackArtist
+        sessionState.albumArtURL = currentTrackAlbumArtUrl
+        sessionState.positionMs = Math.max(0, Number(localPlayer.position) || 0)
+    }
+
+    function restoreSessionState() {
+        var contextURI = (sessionState.contextURI || "").trim()
+        var trackURI = (sessionState.trackURI || "").trim()
+        if (contextURI.length === 0 || trackURI.length === 0) {
+            return
+        }
+
+        activeContextURI = contextURI
+        activeContextName = (sessionState.contextName || "Collection").trim()
+        resumeTargetTrackURI = trackURI
+        resumeTargetPositionMs = Math.max(0, Number(sessionState.positionMs) || 0)
+        currentTrackURI = trackURI
+        currentTrackTitle = sessionState.trackName || ""
+        currentTrackArtist = sessionState.trackArtist || ""
+        currentTrackAlbumArtUrl = sessionState.albumArtURL || ""
+        restoringSession = true
+
+        spotifyAuthBridge.openCollectionRequest = activeContextURI + "\n" + (activeContextName || "Collection") + "\n" + Date.now()
     }
 
     function handleBackNavigation() {
@@ -346,10 +513,14 @@ Window {
         if (readyForSeek) {
             localPlayer.position = target
             pendingSeekTargetMs = target
+        } else if (holdStoppedTrackState) {
+            // Restored non-playing sessions can become seekable later than normal.
+            return
         }
 
         pendingResumeAttempts += 1
-        if (pendingResumeAttempts > 60) {
+        var maxAttempts = holdStoppedTrackState ? 600 : 60
+        if (pendingResumeAttempts > maxAttempts) {
             pendingResumePositionMs = -1
             pendingSeekTargetMs = -1
             pendingSeekRatio = -1
@@ -374,6 +545,17 @@ Window {
         id: localPlayer
         audioOutput: localAudioOutput
         onMediaStatusChanged: {
+            if (mediaStatus === MediaPlayer.EndOfMedia && autoplayEnabled && !manualStopRequested && !streamSourceSwitching) {
+                playAdjacentTrack(1)
+                return
+            }
+            if (holdStoppedTrackState && (mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia || mediaStatus === MediaPlayer.BufferingMedia) && pendingResumePositionMs >= 0) {
+                localPlayer.position = Math.max(0, pendingResumePositionMs)
+                pendingSeekTargetMs = Math.max(0, pendingResumePositionMs)
+                if (localPlayer.playbackState === MediaPlayer.StoppedState) {
+                    localPlayer.pause()
+                }
+            }
             if (streamSourceSwitching && (mediaStatus === MediaPlayer.LoadedMedia || mediaStatus === MediaPlayer.BufferedMedia || mediaStatus === MediaPlayer.BufferingMedia)) {
                 var target = Math.max(0, pendingResumePositionMs)
                 localPlayer.position = target
@@ -413,12 +595,17 @@ Window {
         }
         onPlaybackStateChanged: {
             if (playbackState === MediaPlayer.PlayingState) {
+                holdStoppedTrackState = false
                 streamRecovering = false
                 streamRecoverAttempts = 0
                 streamRecoverTargetPositionMs = -1
+                requestNextTrackPrebuffer()
             }
 
             if (playbackState === MediaPlayer.StoppedState) {
+                if (holdStoppedTrackState) {
+                    return
+                }
                 if (streamSourceSwitching) {
                     return
                 }
@@ -503,7 +690,9 @@ Window {
                     bufferedProgressLatched = 0
                     localPlayer.source = ""
                     localPlayer.source = toFileUrl(nextPath)
-                    localPlayer.play()
+                    if (streamShouldAutoPlay) {
+                        localPlayer.play()
+                    }
                 }
             }
         }
@@ -515,6 +704,20 @@ Window {
         } catch (e) {
             return []
         }
+    }
+
+    property var libraryListEntries: {
+        var base = []
+        base.push({
+            Name: spotifyAuthBridge.likedSongsName || "Liked Songs",
+            URI: "spotify:collection:tracks",
+            TrackCount: Number(spotifyAuthBridge.likedSongsCount) || 0,
+            OwnerName: "Your Library"
+        })
+        for (var i = 0; i < playlistsData.length; i += 1) {
+            base.push(playlistsData[i])
+        }
+        return base
     }
 
     property var trackListData: {
@@ -534,6 +737,7 @@ Window {
             Name: item && item.Name ? item.Name : "",
             URI: item && item.URI ? item.URI : "",
             ArtistText: item && item.ArtistText ? item.ArtistText : "",
+            AlbumArtURL: item && item.AlbumArtURL ? item.AlbumArtURL : "",
             DownloadedPath: item && item.DownloadedPath ? item.DownloadedPath : "",
             DurationMs: item && item.DurationMs ? Number(item.DurationMs) : 0
         }
@@ -580,6 +784,37 @@ Window {
 
     onTrackListDataChanged: {
         syncTrackListModel(trackListData)
+
+        if (restoringSession && resumeTargetTrackURI.length > 0 && trackListModel.count > 0) {
+            var resumeIndex = -1
+            for (var i = 0; i < trackListModel.count; i += 1) {
+                var item = trackListModel.get(i)
+                if (item && (item.URI || "") === resumeTargetTrackURI) {
+                    resumeIndex = i
+                    break
+                }
+            }
+
+            if (resumeIndex >= 0) {
+                startTrackAtIndex(resumeIndex, false)
+                pendingResumePositionMs = resumeTargetPositionMs
+                pendingSeekRatio = -1
+                pendingSeekTargetMs = -1
+                pendingResumeAttempts = 0
+                resumeSeekTimer.restart()
+                restoringSession = false
+                resumeTargetTrackURI = ""
+                resumeTargetPositionMs = -1
+            } else if (spotifyAuthBridge.trackHasMore && !spotifyAuthBridge.isLoadingTracks) {
+                requestLoadMoreTracksPreserveScroll(true)
+            }
+        }
+
+        if (trackListModel.count === 0) {
+            currentTrackIndex = -1
+        } else if (currentTrackIndex >= trackListModel.count) {
+            currentTrackIndex = trackListModel.count - 1
+        }
         if (trackListData.length === 0) {
             loadMoreRequestedForCount = -1
             var lv = activeTrackListView()
@@ -590,101 +825,130 @@ Window {
         }
     }
 
-    Column {
+    Timer {
+        id: sessionPersistTimer
+        interval: 1200
+        repeat: true
+        running: true
+        onTriggered: {
+            if (localPlayer.playbackState === MediaPlayer.PlayingState) {
+                persistSessionState()
+            }
+        }
+    }
+
+    Component.onCompleted: {
+        restoreSessionState()
+    }
+
+    Loader {
+        id: contentLoader
         anchors.fill: parent
-        spacing: 0
-
-        Rectangle {
-            id: topControls
-            width: parent.width
-            color: "#161616"
-            border.color: "#2b2b2b"
-            border.width: 1
-            implicitHeight: controlsColumn.implicitHeight + 20
-
-            Column {
-                id: controlsColumn
-                anchors.fill: parent
-                anchors.margins: 10
-                spacing: 6
-
-                Row {
-                    spacing: 8
-
-                    Button {
-                        text: spotifyAuthBridge.isBusy ? "Authenticating..." : "Connect Spotify"
-                        enabled: !spotifyAuthBridge.isBusy
-                        onClicked: spotifyAuthBridge.startAuthNonce = Date.now()
-                    }
-
-                    Text {
-                        text: spotifyAuthBridge.statusText
-                        color: "#9ad0ff"
-                        wrapMode: Text.WrapAnywhere
-                        width: Math.max(120, controlsColumn.width - 170)
-                    }
-                }
-
-                Text {
-                    text: spotifyAuthBridge.libraryStatus
-                    color: "#9ad0ff"
-                    wrapMode: Text.WrapAnywhere
-                }
-
-                Button {
-                    text: spotifyAuthBridge.isLoadingTracks ? "Opening..." : "Open Liked Songs"
-                    enabled: !spotifyAuthBridge.isLoadingTracks
-                    onClicked: openCollectionFromUI("spotify:collection:tracks", spotifyAuthBridge.likedSongsName)
-                }
-            }
-        }
-
-        Item {
-            width: parent.width
-            height: parent.height - topControls.height
-
-            Loader {
-                id: contentLoader
-                anchors.fill: parent
-                sourceComponent: spotifyAuthBridge.viewMode === "tracks" ? trackListComponent : libraryListComponent
-            }
-        }
+        sourceComponent: spotifyAuthBridge.viewMode === "tracks" ? trackListComponent : libraryListComponent
     }
 
     Component {
         id: libraryListComponent
 
-        ListView {
-            clip: true
-            model: playlistsData
-            delegate: Rectangle {
-                width: ListView.view ? ListView.view.width : parent.width
-                height: 56
-                color: index % 2 === 0 ? "#111722" : "#0f141d"
+        Column {
+            anchors.fill: parent
+            spacing: 0
 
-                Row {
+            Rectangle {
+                width: parent.width
+                color: "#161616"
+                border.color: "#2b2b2b"
+                border.width: 1
+                implicitHeight: controlsColumn.implicitHeight + 20
+
+                Column {
+                    id: controlsColumn
                     anchors.fill: parent
                     anchors.margins: 10
-                    spacing: 10
+                    spacing: 6
 
-                    Text {
-                        text: (modelData.Name || "Unnamed playlist") + " (" + (modelData.TrackCount || 0) + ")"
-                        color: "#e8edf5"
-                        width: Math.max(120, parent.width - 120)
-                        elide: Text.ElideRight
+                    Row {
+                        spacing: 8
+
+                        Button {
+                            text: spotifyAuthBridge.isBusy ? "Authenticating..." : "Connect Spotify"
+                            enabled: !spotifyAuthBridge.isBusy
+                            onClicked: spotifyAuthBridge.startAuthNonce = Date.now()
+                        }
+
+                        Text {
+                            text: spotifyAuthBridge.statusText
+                            color: "#9ad0ff"
+                            wrapMode: Text.WrapAnywhere
+                            width: Math.max(120, controlsColumn.width - 170)
+                        }
                     }
 
                     Text {
-                        text: modelData.OwnerName ? "by " + modelData.OwnerName : ""
-                        color: "#93a1b5"
-                        width: 90
-                        elide: Text.ElideRight
+                        text: spotifyAuthBridge.libraryStatus
+                        color: "#9ad0ff"
+                        wrapMode: Text.WrapAnywhere
+                    }
+
+                    Row {
+                        spacing: 10
+
+                        Text {
+                            text: "Volume"
+                            color: "#8ea4c2"
+                            verticalAlignment: Text.AlignVCenter
+                        }
+
+                        Slider {
+                            width: 160
+                            from: 0
+                            to: 1
+                            value: userVolume
+                            onValueChanged: userVolume = value
+                        }
+
+                        Button {
+                            text: "Clear Stream Cache"
+                            onClicked: spotifyAuthBridge.clearStreamCacheAllNonce = Date.now()
+                        }
                     }
                 }
+            }
 
-                MouseArea {
-                    anchors.fill: parent
-                    onClicked: openCollectionFromUI(modelData.URI || "", modelData.Name || "Playlist")
+            ListView {
+                width: parent.width
+                height: Math.max(0, parent.height - (controlsColumn.implicitHeight + 20))
+                clip: true
+                model: libraryListEntries
+                delegate: Rectangle {
+                    width: ListView.view ? ListView.view.width : parent.width
+                    height: 56
+                    color: index % 2 === 0 ? "#111722" : "#0f141d"
+
+                    Row {
+                        anchors.fill: parent
+                        anchors.margins: 10
+                        spacing: 10
+
+                        Text {
+                            text: (modelData.Name || "Unnamed playlist") + " (" + (modelData.TrackCount || 0) + ")"
+                            color: "#e8edf5"
+                            width: Math.max(120, parent.width - 120)
+                            elide: Text.ElideRight
+                        }
+
+                        Text {
+                            text: modelData.OwnerName ? "by " + modelData.OwnerName : ""
+                            color: "#93a1b5"
+                            width: 90
+                            elide: Text.ElideRight
+                        }
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: openCollectionFromUI(modelData.URI || "", modelData.Name || "Playlist")
+                    }
                 }
             }
         }
@@ -700,6 +964,7 @@ Window {
             spacing: 0
 
             Rectangle {
+                id: trackHeader
                 width: parent.width
                 height: 52
                 color: "#121c2d"
@@ -712,8 +977,32 @@ Window {
                     spacing: 10
 
                     Button {
-                        text: "Back"
+                        width: 44
+                        height: 36
                         onClicked: handleBackNavigation()
+
+                        contentItem: Item {
+                            anchors.fill: parent
+
+                            Shape {
+                                anchors.centerIn: parent
+                                width: 14
+                                height: 14
+                                antialiasing: true
+
+                                ShapePath {
+                                    strokeColor: actionButtonTextColor
+                                    strokeWidth: 2
+                                    fillColor: "transparent"
+                                    capStyle: ShapePath.RoundCap
+                                    joinStyle: ShapePath.RoundJoin
+                                    startX: 10
+                                    startY: 2
+                                    PathLine { x: 4; y: 7 }
+                                    PathLine { x: 10; y: 12 }
+                                }
+                            }
+                        }
                     }
 
                     Text {
@@ -726,6 +1015,7 @@ Window {
             }
 
             Text {
+                id: trackStatusText
                 width: parent.width
                 text: spotifyAuthBridge.trackListStatus
                 color: "#9ad0ff"
@@ -733,118 +1023,10 @@ Window {
                 padding: 8
             }
 
-            Rectangle {
-                width: parent.width
-                height: 52
-                color: "#0f1520"
-                border.color: "#223148"
-                border.width: 1
-
-                Row {
-                    anchors.fill: parent
-                    anchors.margins: 8
-                    spacing: 10
-
-                    Button {
-                        width: 86
-                        text: localPlayer.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
-                        enabled: localPlayer.source && localPlayer.source.toString().length > 0
-                        onClicked: togglePlayPause()
-                    }
-
-                    Column {
-                        width: Math.max(120, parent.width - 96)
-                        spacing: 5
-
-                        Rectangle {
-                            id: progressTrack
-                            width: parent.width
-                            height: 14
-                            radius: 7
-                            color: "#182232"
-
-                            Rectangle {
-                                width: parent.width * bufferedProgress
-                                height: parent.height
-                                radius: 7
-                                color: "#5f7391"
-                            }
-
-                            Rectangle {
-                                width: parent.width * playbackProgress
-                                height: parent.height
-                                radius: 7
-                                color: "#9ad0ff"
-                            }
-
-                            MouseArea {
-                                anchors.fill: parent
-                                anchors.margins: -10
-                                onPressed: function(mouse) {
-                                    if (!seekEnabledForCurrentSource) {
-                                        spotifyAuthBridge.trackListStatus = "Seek is available after stream buffering finishes"
-                                        return
-                                    }
-                                    scrubbingActive = true
-                                    resumeAfterScrub = localPlayer.playbackState === MediaPlayer.PlayingState
-                                    if (resumeAfterScrub) {
-                                        localPlayer.pause()
-                                    }
-                                    seekToX(mouse.x, progressTrack.width)
-                                }
-                                onPositionChanged: function(mouse) {
-                                    if (mouse.buttons & Qt.LeftButton) {
-                                        seekToX(mouse.x, progressTrack.width)
-                                    }
-                                }
-                                onReleased: {
-                                    scrubbingActive = false
-                                    if (resumeAfterScrub) {
-                                        localPlayer.play()
-                                    }
-                                    resumeAfterScrub = false
-                                }
-                                onCanceled: {
-                                    scrubbingActive = false
-                                    if (resumeAfterScrub) {
-                                        localPlayer.play()
-                                    }
-                                    resumeAfterScrub = false
-                                }
-                                cursorShape: Qt.PointingHandCursor
-                            }
-                        }
-
-                        Row {
-                            width: parent.width
-
-                            Text {
-                                id: leftTime
-                                text: formatMs(localPlayer.position)
-                                color: "#8ea4c2"
-                                font.pixelSize: 11
-                            }
-
-                            Item {
-                                width: Math.max(0, parent.width - leftTime.width - rightTime.width)
-                                height: 1
-                            }
-
-                            Text {
-                                id: rightTime
-                                text: formatMs(effectiveDurationMs)
-                                color: "#8ea4c2"
-                                font.pixelSize: 11
-                            }
-                        }
-                    }
-                }
-            }
-
             ListView {
                 id: trackListView
                 width: parent.width
-                height: parent.height - 200
+                height: Math.max(120, parent.height - trackHeader.height - trackStatusText.implicitHeight - nowPlayingPanel.height - playbackPanel.height)
                 clip: true
                 reuseItems: true
                 cacheBuffer: 0
@@ -882,36 +1064,66 @@ Window {
                     width: ListView.view ? ListView.view.width : parent.width
                     height: 60
                     color: index % 2 === 0 ? "#0f1623" : "#0d131d"
+                    property bool isDownloaded: !!(DownloadedPath && String(DownloadedPath).trim().length > 0)
+                    property int actionButtonHeight: Math.max(Math.round(height * 0.8), 48)
 
                     Row {
                         anchors.fill: parent
                         anchors.margins: 8
                         spacing: 8
 
-                        Column {
-                            width: Math.max(120, parent.width - 260)
-                            spacing: 2
+                        Item {
+                            id: detailsSlot
+                            width: Math.max(120, parent.width - rightActions.implicitWidth - 8)
+                            height: parent.height
 
-                            Row {
+                            Column {
+                                id: detailsColumn
+                                anchors.verticalCenter: parent.verticalCenter
                                 width: parent.width
-                                spacing: 6
+                                spacing: 2
+
+                                Row {
+                                    width: parent.width
+                                    spacing: 6
+
+                                    Text {
+                                        text: Name || URI || "Unknown track"
+                                        color: "#f0f5ff"
+                                        elide: Text.ElideRight
+                                        width: parent.width
+                                    }
+                                }
 
                                 Text {
-                                    text: Name || URI || "Unknown track"
-                                    color: "#f0f5ff"
+                                    text: ArtistText || URI || ""
+                                    color: "#8ea4c2"
                                     elide: Text.ElideRight
-                                    width: DownloadedPath ? Math.max(80, parent.width - downloadedBadge.width - 8) : parent.width
+                                    width: parent.width
                                 }
+                            }
+                        }
+
+                        Row {
+                            id: rightActions
+                            y: Math.floor((parent.height - height) / 2)
+                            height: actionButtonHeight
+                            spacing: 8
+
+                            Item {
+                                visible: isDownloaded
+                                width: visible ? (downloadedText.implicitWidth + 10) : 0
+                                height: parent.height
 
                                 Rectangle {
                                     id: downloadedBadge
-                                    visible: !!DownloadedPath
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    width: parent.width
+                                    height: Math.max(20, Math.round(actionButtonHeight * 0.56))
                                     radius: 4
                                     color: "#1f7a3a"
                                     border.color: "#36a85a"
                                     border.width: 1
-                                    implicitHeight: 18
-                                    implicitWidth: downloadedText.implicitWidth + 10
 
                                     Text {
                                         id: downloadedText
@@ -923,57 +1135,86 @@ Window {
                                 }
                             }
 
-                            Text {
-                                text: ArtistText || URI || ""
-                                color: "#8ea4c2"
-                                elide: Text.ElideRight
-                                width: parent.width
-                            }
-                        }
+                            Item {
+                                id: downloadSlot
+                                width: visible ? 36 : 0
+                                height: rightActions.height
+                                visible: !isDownloaded
 
-                        Button {
-                            text: spotifyAuthBridge.isDownloadingTrack ? "Downloading..." : "Download"
-                            enabled: !spotifyAuthBridge.isDownloadingTrack
-                            onClicked: spotifyAuthBridge.downloadTrackRequest = (URI || "") + "\n" + (Name || "Track") + "\n" + Date.now()
-                        }
+                                Button {
+                                    id: downloadActionButton
+                                    anchors.fill: parent
+                                    enabled: !spotifyAuthBridge.isDownloadingTrack
+                                    onClicked: spotifyAuthBridge.downloadTrackRequest = (URI || "") + "\n" + (Name || "Track") + "\n" + Date.now()
 
-                        Button {
-                            text: "Play"
-                            enabled: DownloadedPath ? true : !spotifyAuthBridge.isStreamingTrack
-                            onClicked: {
-                                manualStopRequested = true
-                                streamRecovering = false
-                                streamRecoverAttempts = 0
-                                streamRecoverTargetPositionMs = -1
-                                pendingResumePositionMs = -1
-                                pendingSeekTargetMs = -1
-                                pendingSeekRatio = -1
-                                pendingResumeAttempts = 0
-                                resumeSeekTimer.stop()
-                                localPlayer.stop()
-                                spotifyAuthBridge.clearStreamNonce = Date.now()
-                                manualStopRequested = false
-                                if (DownloadedPath) {
-                                    expectedDurationMs = DurationMs || 0
-                                    currentPlayingPath = DownloadedPath || ""
-                                    localPlayer.source = toFileUrl(currentPlayingPath)
-                                    localPlayer.play()
-                                } else {
-                                    expectedDurationMs = DurationMs || 0
-                                    spotifyAuthBridge.streamTrackRequest = (URI || "") + "\n" + (Name || "Track") + "\n" + Date.now()
+                                    contentItem: Item {
+                                        id: downloadContent
+                                        anchors.fill: parent
+                                        property color iconColor: downloadActionButton.enabled ? actionButtonTextColor : actionButtonTextColorDisabled
+
+                                        Text {
+                                            anchors.centerIn: parent
+                                            visible: spotifyAuthBridge.isDownloadingTrack
+                                            text: "..."
+                                            color: downloadContent.iconColor
+                                            font.pixelSize: 14
+                                        }
+
+                                        Item {
+                                            anchors.centerIn: parent
+                                            visible: !spotifyAuthBridge.isDownloadingTrack
+                                            width: 18
+                                            height: 18
+
+                                            Shape {
+                                                anchors.fill: parent
+                                                antialiasing: true
+
+                                                ShapePath {
+                                                    strokeColor: downloadContent.iconColor
+                                                    strokeWidth: 2
+                                                    fillColor: "transparent"
+                                                    capStyle: ShapePath.RoundCap
+                                                    joinStyle: ShapePath.RoundJoin
+                                                    startX: 9
+                                                    startY: 2
+                                                    PathLine { x: 9; y: 12 }
+                                                    PathLine { x: 5; y: 8 }
+                                                    PathMove { x: 9; y: 12 }
+                                                    PathLine { x: 13; y: 8 }
+                                                }
+
+                                                ShapePath {
+                                                    strokeColor: downloadContent.iconColor
+                                                    strokeWidth: 2
+                                                    fillColor: "transparent"
+                                                    capStyle: ShapePath.RoundCap
+                                                    startX: 3
+                                                    startY: 16
+                                                    PathLine { x: 15; y: 16 }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        }
 
-                        Button {
-                            text: "Stop"
-                            enabled: localPlayer.playbackState !== MediaPlayer.StoppedState
-                            onClicked: {
-                                manualStopRequested = true
-                                localPlayer.stop()
-                                currentPlayingPath = ""
-                                expectedDurationMs = 0
-                                spotifyAuthBridge.clearStreamNonce = Date.now()
+                            Button {
+                                id: rowPlayButton
+                                width: Math.max(84, implicitWidth + 16)
+                                height: rightActions.height
+                                text: "Play"
+                                font.pixelSize: 13
+                                enabled: isDownloaded ? true : !spotifyAuthBridge.isStreamingTrack
+                                contentItem: Text {
+                                    text: rowPlayButton.text
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                    color: rowPlayButton.enabled ? actionButtonTextColor : actionButtonTextColorDisabled
+                                    font.pixelSize: rowPlayButton.font.pixelSize
+                                    elide: Text.ElideRight
+                                }
+                                onClicked: playTrackAtIndex(index)
                             }
                         }
                     }
@@ -981,10 +1222,11 @@ Window {
             }
 
             Rectangle {
+                id: nowPlayingPanel
                 width: parent.width
-                height: 52
-                color: "#101724"
-                border.color: "#25344f"
+                height: 74
+                color: "#0d141f"
+                border.color: "#22324d"
                 border.width: 1
 
                 Row {
@@ -992,41 +1234,188 @@ Window {
                     anchors.margins: 8
                     spacing: 10
 
-                    Button {
-                        text: spotifyAuthBridge.isLoadingTracks ? "Loading..." : "Load More"
-                        enabled: !spotifyAuthBridge.isLoadingTracks && spotifyAuthBridge.trackHasMore
-                        visible: spotifyAuthBridge.trackHasMore || spotifyAuthBridge.isLoadingTracks
-                        onClicked: requestLoadMoreTracksPreserveScroll(true)
+                    Rectangle {
+                        width: 56
+                        height: 56
+                        radius: 6
+                        color: "#1a2638"
+                        border.color: "#2a3c59"
+                        border.width: 1
+                        clip: true
+
+                        Image {
+                            id: nowPlayingArtImage
+                            anchors.fill: parent
+                            source: currentTrackAlbumArtUrl
+                            fillMode: Image.PreserveAspectCrop
+                            asynchronous: true
+                            cache: true
+                            visible: source.toString().length > 0 && status === Image.Ready
+                        }
+
+                        Text {
+                            anchors.centerIn: parent
+                            visible: !nowPlayingArtImage.visible
+                            text: "♪"
+                            color: "#8ea4c2"
+                            font.pixelSize: 20
+                        }
                     }
 
-                    Text {
-                        text: spotifyAuthBridge.trackTotal > 0
-                              ? (trackListModel.count + " / " + spotifyAuthBridge.trackTotal)
-                              : (trackListModel.count + " tracks")
-                        color: "#8ea4c2"
-                        verticalAlignment: Text.AlignVCenter
+                    Column {
+                        width: Math.max(120, parent.width - 56 - 10)
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 2
+
+                        Text {
+                            width: parent.width
+                            text: currentTrackTitle.length > 0 ? currentTrackTitle : "Nothing playing"
+                            color: "#e8edf5"
+                            elide: Text.ElideRight
+                            font.pixelSize: 14
+                            font.bold: true
+                        }
+
+                        Text {
+                            width: parent.width
+                            text: currentTrackArtist
+                            color: "#8ea4c2"
+                            elide: Text.ElideRight
+                            font.pixelSize: 12
+                            visible: currentTrackArtist.length > 0
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                id: playbackPanel
+                width: parent.width
+                height: 122
+                color: "#101724"
+                border.color: "#25344f"
+                border.width: 1
+
+                Column {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    spacing: 8
+
+                    Rectangle {
+                        id: progressTrack
+                        width: parent.width
+                        height: 14
+                        radius: 7
+                        color: "#182232"
+
+                        Rectangle {
+                            width: parent.width * bufferedProgress
+                            height: parent.height
+                            radius: 7
+                            color: "#5f7391"
+                        }
+
+                        Rectangle {
+                            width: parent.width * playbackProgress
+                            height: parent.height
+                            radius: 7
+                            color: "#9ad0ff"
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            anchors.margins: -10
+                            onPressed: function(mouse) {
+                                if (!seekEnabledForCurrentSource) {
+                                    spotifyAuthBridge.trackListStatus = "Seek is available after stream buffering finishes"
+                                    return
+                                }
+                                scrubbingActive = true
+                                resumeAfterScrub = localPlayer.playbackState === MediaPlayer.PlayingState
+                                if (resumeAfterScrub) {
+                                    localPlayer.pause()
+                                }
+                                seekToX(mouse.x, progressTrack.width)
+                            }
+                            onPositionChanged: function(mouse) {
+                                if (mouse.buttons & Qt.LeftButton) {
+                                    seekToX(mouse.x, progressTrack.width)
+                                }
+                            }
+                            onReleased: {
+                                scrubbingActive = false
+                                if (resumeAfterScrub) {
+                                    localPlayer.play()
+                                }
+                                resumeAfterScrub = false
+                            }
+                            onCanceled: {
+                                scrubbingActive = false
+                                if (resumeAfterScrub) {
+                                    localPlayer.play()
+                                }
+                                resumeAfterScrub = false
+                            }
+                            cursorShape: Qt.PointingHandCursor
+                        }
                     }
 
-                    Text {
-                        text: "Volume"
-                        color: "#8ea4c2"
-                        verticalAlignment: Text.AlignVCenter
+                    Row {
+                        width: parent.width
+
+                        Text {
+                            id: leftTime
+                            text: formatMs(localPlayer.position)
+                            color: "#8ea4c2"
+                            font.pixelSize: 11
+                        }
+
+                        Item {
+                            width: Math.max(0, parent.width - leftTime.width - rightTime.width)
+                            height: 1
+                        }
+
+                        Text {
+                            id: rightTime
+                            text: formatMs(effectiveDurationMs)
+                            color: "#8ea4c2"
+                            font.pixelSize: 11
+                        }
                     }
 
-                    Slider {
-                        width: 140
-                        from: 0
-                        to: 1
-                        value: userVolume
-                        onValueChanged: userVolume = value
-                    }
+                    Item {
+                        width: parent.width
+                        height: 40
 
-                    Button {
-                        text: "Clear Stream Cache"
-                        onClicked: spotifyAuthBridge.clearStreamCacheAllNonce = Date.now()
+                        Row {
+                            anchors.centerIn: parent
+                            spacing: 10
+
+                            Button {
+                                width: 96
+                                text: "Previous"
+                                enabled: currentTrackIndex > 0
+                                onClicked: playAdjacentTrack(-1)
+                            }
+
+                            Button {
+                                width: 96
+                                text: localPlayer.playbackState === MediaPlayer.PlayingState ? "Pause" : "Play"
+                                enabled: localPlayer.source && localPlayer.source.toString().length > 0
+                                onClicked: togglePlayPause()
+                            }
+
+                            Button {
+                                width: 96
+                                text: "Next"
+                                enabled: currentTrackIndex >= 0 && currentTrackIndex < (trackListModel.count - 1)
+                                onClicked: playAdjacentTrack(1)
+                            }
+                        }
                     }
                 }
             }
         }
     }
+
 }

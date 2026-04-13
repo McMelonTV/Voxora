@@ -84,6 +84,16 @@ func app_main() {
 	}
 
 	url := qt.NewQUrl3("qrc:/assets/main.qml")
+	if runtime.GOOS != "android" {
+		for _, candidate := range []string{"assets/main.qml", "voxora/assets/main.qml"} {
+			if _, err := os.Stat(candidate); err == nil {
+				if abs, absErr := filepath.Abs(candidate); absErr == nil {
+					url = qt.NewQUrl3("file://" + filepath.ToSlash(abs))
+					break
+				}
+			}
+		}
+	}
 	if runtime.GOOS == "android" {
 		qt.QResource_RegisterResource("assets:/android_rcc_bundle.rcc")
 		engine.AddImportPath("assets:/qml")

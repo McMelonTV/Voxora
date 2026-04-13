@@ -2,6 +2,7 @@ package authbridge
 
 import (
 	"context"
+	"crypto/sha1"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,11 +42,15 @@ type SpotifyBridge struct {
 	trackItems      []libspotdl.LibraryTrackSummary
 	loadingTracks   bool
 
-	downloadedByURI  map[string]string
-	currentStream    string
-	streamReadyNonce int
-	streamCancel     context.CancelFunc
-	streamOpID       int
+	downloadedByURI    map[string]string
+	downloadedArtByURI map[string]string
+	currentStream      string
+	streamReadyNonce   int
+	streamCancel       context.CancelFunc
+	streamOpID         int
+	prebufferCancel    context.CancelFunc
+	prebufferTrackURI  string
+	prebufferOpID      int
 
 	transferMu           sync.Mutex
 	sharedDownloader     *libspotdl.Downloader
@@ -61,7 +66,7 @@ type SpotifyBridge struct {
 
 func NewSpotifyBridge() *SpotifyBridge {
 	props := qml.NewQQmlPropertyMap()
-	b := &SpotifyBridge{props: props, downloadedByURI: make(map[string]string)}
+	b := &SpotifyBridge{props: props, downloadedByURI: make(map[string]string), downloadedArtByURI: make(map[string]string)}
 	b.startStreamHTTPServer()
 
 	b.set("state", "idle")
@@ -86,6 +91,7 @@ func NewSpotifyBridge() *SpotifyBridge {
 	b.set("downloadTrackRequest", "")
 	b.set("isStreamingTrack", false)
 	b.set("streamTrackRequest", "")
+	b.set("prebufferTrackRequest", "")
 	b.set("streamPlayPath", "")
 	b.set("streamPlayReadyNonce", 0)
 	b.set("streamCacheReady", false)
@@ -112,6 +118,8 @@ func NewSpotifyBridge() *SpotifyBridge {
 			go b.downloadTrack(value.ToString())
 		case "streamTrackRequest":
 			go b.streamTrack(value.ToString())
+		case "prebufferTrackRequest":
+			go b.prebufferTrack(value.ToString())
 		case "clearStreamNonce":
 			go b.clearStreamCache()
 		case "clearStreamCacheAllNonce":
@@ -149,6 +157,11 @@ func (b *SpotifyBridge) Close() {
 		b.streamCancel()
 		b.streamCancel = nil
 	}
+	if b.prebufferCancel != nil {
+		b.prebufferCancel()
+		b.prebufferCancel = nil
+		b.prebufferTrackURI = ""
+	}
 	if strings.TrimSpace(b.activeStreamFIFO) != "" {
 		_ = os.Remove(b.activeStreamFIFO)
 		b.activeStreamFIFO = ""
@@ -183,6 +196,7 @@ func (b *SpotifyBridge) startStreamHTTPServer() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stream", b.handleStreamHTTP)
+	mux.HandleFunc("/art", b.handleArtworkHTTP)
 
 	server := &http.Server{Handler: mux}
 
@@ -208,6 +222,41 @@ func (b *SpotifyBridge) streamHTTPURL(kind, uri string) string {
 		return ""
 	}
 	return fmt.Sprintf("%s/stream?kind=%s&uri=%s", base, kind, url.QueryEscape(uri))
+}
+
+func (b *SpotifyBridge) artworkHTTPURL(rawURL string) string {
+	b.mu.Lock()
+	base := b.streamHTTPBaseURL
+	b.mu.Unlock()
+	if strings.TrimSpace(base) == "" {
+		return ""
+	}
+	clean := strings.TrimSpace(rawURL)
+	if clean == "" {
+		return ""
+	}
+	parsed, err := url.Parse(clean)
+	if err != nil {
+		return ""
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return ""
+	}
+	return fmt.Sprintf("%s/art?url=%s", base, url.QueryEscape(clean))
+}
+
+func (b *SpotifyBridge) embeddedArtworkHTTPURL(uri string) string {
+	b.mu.Lock()
+	base := b.streamHTTPBaseURL
+	b.mu.Unlock()
+	if strings.TrimSpace(base) == "" {
+		return ""
+	}
+	cleanURI := strings.TrimSpace(uri)
+	if cleanURI == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/art?uri=%s", base, url.QueryEscape(cleanURI))
 }
 
 func (b *SpotifyBridge) handleStreamHTTP(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +293,153 @@ func (b *SpotifyBridge) handleStreamHTTP(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "audio/ogg")
 	w.Header().Set("Accept-Ranges", "bytes")
 	http.ServeContent(w, r, filepath.Base(path), time.Now(), file)
+}
+
+func (b *SpotifyBridge) handleArtworkHTTP(w http.ResponseWriter, r *http.Request) {
+	if uri := strings.TrimSpace(r.URL.Query().Get("uri")); uri != "" {
+		b.mu.Lock()
+		embeddedPath := strings.TrimSpace(b.downloadedArtByURI[uri])
+		b.mu.Unlock()
+		if embeddedPath == "" {
+			http.NotFound(w, r)
+			return
+		}
+		b.serveArtworkFile(w, r, embeddedPath)
+		return
+	}
+
+	raw := strings.TrimSpace(r.URL.Query().Get("url"))
+	if raw == "" {
+		http.Error(w, "missing url", http.StatusBadRequest)
+		return
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		http.Error(w, "invalid url", http.StatusBadRequest)
+		return
+	}
+
+	cachePath := remoteArtworkCachePath(raw)
+	if cachePath != "" {
+		if _, statErr := os.Stat(cachePath); statErr == nil {
+			b.serveArtworkFile(w, r, cachePath)
+			return
+		}
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, raw, nil)
+	if err != nil {
+		http.Error(w, "request build failed", http.StatusBadRequest)
+		return
+	}
+	req.Header.Set("User-Agent", "Voxora/1.0")
+
+	client := &http.Client{Timeout: 12 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "art fetch failed", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		http.Error(w, "art fetch failed", http.StatusBadGateway)
+		return
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 8*1024*1024))
+	if readErr != nil || len(body) == 0 {
+		http.Error(w, "art fetch failed", http.StatusBadGateway)
+		return
+	}
+
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if contentType == "" {
+		contentType = http.DetectContentType(body)
+	}
+
+	if cachePath != "" {
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err == nil {
+			tmp := cachePath + ".tmp"
+			if writeErr := os.WriteFile(tmp, body, 0o644); writeErr == nil {
+				_ = os.Rename(tmp, cachePath)
+			}
+		}
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write(body)
+}
+
+func (b *SpotifyBridge) serveArtworkFile(w http.ResponseWriter, r *http.Request, path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+
+	head := make([]byte, 512)
+	n, _ := file.Read(head)
+	_, _ = file.Seek(0, io.SeekStart)
+	contentType := http.DetectContentType(head[:n])
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "image/jpeg"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	http.ServeContent(w, r, filepath.Base(path), time.Now(), file)
+}
+
+func artworkCacheDir() string {
+	if runtime.GOOS == "android" {
+		baseDir := filepath.Dir(bridgeCredentialsFile())
+		if strings.TrimSpace(baseDir) != "" {
+			return filepath.Join(baseDir, "artwork")
+		}
+	}
+
+	cacheDir, err := os.UserCacheDir()
+	if err == nil && strings.TrimSpace(cacheDir) != "" {
+		return filepath.Join(cacheDir, "voxora", "artwork")
+	}
+	return filepath.Join(os.TempDir(), "voxora", "artwork")
+}
+
+func remoteArtworkCachePath(rawURL string) string {
+	clean := strings.TrimSpace(rawURL)
+	if clean == "" {
+		return ""
+	}
+	sum := sha1.Sum([]byte(clean))
+	return filepath.Join(artworkCacheDir(), "remote", fmt.Sprintf("%x.img", sum))
+}
+
+func embeddedArtworkExt(mimeType string) string {
+	switch strings.ToLower(strings.TrimSpace(mimeType)) {
+	case "image/png":
+		return ".png"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	default:
+		return ".jpg"
+	}
+}
+
+func embeddedArtworkPathForURI(uri, mimeType string) string {
+	clean := sanitizeTrackID(uri)
+	if clean == "" {
+		return ""
+	}
+	return filepath.Join(artworkCacheDir(), "embedded", clean+embeddedArtworkExt(mimeType))
 }
 
 func (b *SpotifyBridge) startFlow() {
@@ -838,7 +1034,7 @@ func (b *SpotifyBridge) clearAllStreamCache() {
 			return nil
 		}
 		name := strings.ToLower(d.Name())
-		if strings.HasSuffix(name, ".stream.ogg") || strings.HasSuffix(name, ".stream.play.ogg") || strings.HasSuffix(name, ".stream.ogg.part") || strings.HasSuffix(name, ".stream.ogg.done") || strings.HasSuffix(name, ".live.fifo") {
+		if strings.HasSuffix(name, ".stream.ogg") || strings.HasSuffix(name, ".stream.play.ogg") || strings.HasSuffix(name, ".stream.ogg.part") || strings.HasSuffix(name, ".stream.ogg.done") || strings.HasSuffix(name, ".live.fifo") || strings.HasSuffix(name, ".prefetch.part") {
 			if remErr := os.Remove(path); remErr == nil {
 				removed++
 			}
@@ -847,6 +1043,116 @@ func (b *SpotifyBridge) clearAllStreamCache() {
 	})
 
 	b.set("trackListStatus", fmt.Sprintf("Cleared %d stream cache file(s)", removed))
+}
+
+func (b *SpotifyBridge) prebufferTrack(raw string) {
+	parts := strings.SplitN(raw, "\n", 3)
+	if len(parts) < 1 {
+		return
+	}
+
+	trackURI := strings.TrimSpace(parts[0])
+	if !strings.HasPrefix(trackURI, "spotify:track:") {
+		return
+	}
+
+	outputPath := streamCachePathForURI(trackURI)
+	if isUsableCachedStream(outputPath) {
+		_ = os.Chtimes(outputPath, time.Now(), time.Now())
+		return
+	}
+
+	cacheDir := streamCacheDir()
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return
+	}
+	b.pruneStreamCacheIfLowDisk(cacheDir)
+
+	b.mu.Lock()
+	if b.prebufferTrackURI == trackURI && b.prebufferCancel != nil {
+		b.mu.Unlock()
+		return
+	}
+	if b.prebufferCancel != nil {
+		b.prebufferCancel()
+		b.prebufferCancel = nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	b.prebufferCancel = cancel
+	b.prebufferTrackURI = trackURI
+	b.prebufferOpID++
+	opID := b.prebufferOpID
+	b.mu.Unlock()
+
+	defer func() {
+		b.mu.Lock()
+		if b.prebufferOpID == opID {
+			b.prebufferCancel = nil
+			b.prebufferTrackURI = ""
+		}
+		b.mu.Unlock()
+	}()
+
+	credentialsFile := bridgeCredentialsFile()
+	ffmpegPath := bridgePrepareFFmpegEnv()
+	log := newBridgeLogger().WithField("component", "spotify_prebuffer")
+	loader, err := libspotdl.New(ctx, libspotdl.Config{
+		Auth:       libspotdl.AuthConfig{CredentialsFile: credentialsFile},
+		Logger:     log,
+		FFmpegPath: ffmpegPath,
+	})
+	if err != nil {
+		cancel()
+		return
+	}
+	defer func() {
+		_ = loader.Close()
+	}()
+
+	tmpPath := outputPath + ".prefetch.part"
+	_ = os.Remove(tmpPath)
+	_ = os.Remove(streamCacheDoneMarkerPathForStream(outputPath))
+
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		cancel()
+		return
+	}
+	defer func() {
+		_ = f.Close()
+	}()
+
+	_, _, err = loader.StreamTrack(ctx, trackURI, []io.Writer{f}, nil)
+	cancel()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+
+	b.mu.Lock()
+	isCurrent := b.prebufferOpID == opID
+	b.mu.Unlock()
+	if !isCurrent {
+		_ = os.Remove(tmpPath)
+		return
+	}
+
+	if err := os.Rename(tmpPath, outputPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if doneMarkerPath := streamCacheDoneMarkerPathForStream(outputPath); doneMarkerPath != "" {
+		_ = os.WriteFile(doneMarkerPath, []byte("ok\n"), 0o644)
+	}
 }
 
 func (b *SpotifyBridge) streamTrack(raw string) {
@@ -922,10 +1228,10 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 			b.streamReadyNonce++
 			nonce := b.streamReadyNonce
 			b.mu.Unlock()
-			b.set("streamPlayPath", cacheURL)
+			b.set("streamPlayPath", outputPath)
 			b.set("streamPlayReadyNonce", nonce)
 			b.set("streamCacheReady", true)
-			b.set("streamCachePath", cacheURL)
+			b.set("streamCachePath", outputPath)
 			b.set("streamCacheFilePath", outputPath)
 			b.set("isStreamingTrack", false)
 			b.set("trackListStatus", "Playing cached stream \""+trackName+"\"")
@@ -1192,7 +1498,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 				}
 			}
 			b.set("streamCacheReady", true)
-			b.set("streamCachePath", cacheURL)
+			b.set("streamCachePath", outputPath)
 			b.set("streamCacheFilePath", outputPath)
 			b.set("isStreamingTrack", false)
 			b.set("trackListStatus", "Playing streamed \""+trackName+"\"")
@@ -1250,7 +1556,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 			}
 		}
 		b.set("streamCacheReady", true)
-		b.set("streamCachePath", cacheURL)
+		b.set("streamCachePath", outputPath)
 		b.set("streamCacheFilePath", outputPath)
 	}
 	if info, statErr := os.Stat(outputPath); statErr == nil {
@@ -1261,7 +1567,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 		b.set("streamBufferedTotal", info.Size())
 	}
 	b.set("streamCacheReady", true)
-	b.set("streamCachePath", cacheURL)
+	b.set("streamCachePath", outputPath)
 	b.set("streamCacheFilePath", outputPath)
 
 	b.mu.Lock()
@@ -1380,6 +1686,53 @@ func extractTrackURIFromMediaTags(filePath string) string {
 	return strings.TrimSpace(match)
 }
 
+func extractEmbeddedArtworkFromMedia(filePath string) ([]byte, string) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, ""
+	}
+	defer file.Close()
+
+	meta, err := tag.ReadFrom(file)
+	if err != nil {
+		return nil, ""
+	}
+	pic := meta.Picture()
+	if pic == nil || len(pic.Data) == 0 {
+		return nil, ""
+	}
+	return pic.Data, strings.TrimSpace(pic.MIMEType)
+}
+
+func cacheEmbeddedArtworkForTrackURI(uri, mediaPath string) string {
+	cleanURI := strings.TrimSpace(uri)
+	cleanPath := strings.TrimSpace(mediaPath)
+	if cleanURI == "" || cleanPath == "" {
+		return ""
+	}
+
+	data, mimeType := extractEmbeddedArtworkFromMedia(cleanPath)
+	if len(data) == 0 {
+		return ""
+	}
+
+	artPath := embeddedArtworkPathForURI(cleanURI, mimeType)
+	if artPath == "" {
+		return ""
+	}
+	if err := os.MkdirAll(filepath.Dir(artPath), 0o755); err != nil {
+		return ""
+	}
+	tmp := artPath + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return ""
+	}
+	if err := os.Rename(tmp, artPath); err != nil {
+		return ""
+	}
+	return artPath
+}
+
 func isScannableAudioFile(path string) bool {
 	ext := strings.ToLower(strings.TrimSpace(filepath.Ext(path)))
 	switch ext {
@@ -1434,15 +1787,20 @@ func scanDownloadedAudioTags(downloadDir string) map[string]string {
 func (b *SpotifyBridge) loadDownloadedIndex() {
 	log := newBridgeLogger().WithField("component", "download_scan")
 	clean := make(map[string]string)
+	art := make(map[string]string)
 	for uri, filePath := range scanDownloadedAudioTags(defaultDownloadDir()) {
 		clean[uri] = filePath
+		if artPath := cacheEmbeddedArtworkForTrackURI(uri, filePath); artPath != "" {
+			art[uri] = artPath
+		}
 	}
 
 	b.mu.Lock()
 	b.downloadedByURI = clean
+	b.downloadedArtByURI = art
 	b.mu.Unlock()
 
-	log.WithField("recognized_tracks", len(clean)).Debug("loaded downloaded tracks from metadata scan")
+	log.WithField("recognized_tracks", len(clean)).WithField("embedded_art_tracks", len(art)).Debug("loaded downloaded tracks from metadata scan")
 }
 
 func (b *SpotifyBridge) annotateDownloadedTracks(items []libspotdl.LibraryTrackSummary) []libspotdl.LibraryTrackSummary {
@@ -1474,6 +1832,7 @@ func (b *SpotifyBridge) annotateDownloadedTracks(items []libspotdl.LibraryTrackS
 		b.mu.Lock()
 		for _, uri := range missing {
 			delete(b.downloadedByURI, uri)
+			delete(b.downloadedArtByURI, uri)
 		}
 		b.mu.Unlock()
 	}
@@ -1481,6 +1840,35 @@ func (b *SpotifyBridge) annotateDownloadedTracks(items []libspotdl.LibraryTrackS
 }
 
 func (b *SpotifyBridge) publishTrackList(items []libspotdl.LibraryTrackSummary) {
+	b.mu.Lock()
+	artIndex := make(map[string]string, len(b.downloadedArtByURI))
+	for uri, artPath := range b.downloadedArtByURI {
+		artIndex[uri] = artPath
+	}
+	b.mu.Unlock()
+
+	if len(items) > 0 {
+		normalized := make([]libspotdl.LibraryTrackSummary, 0, len(items))
+		for _, item := range items {
+			if item.Downloaded {
+				if artPath, ok := artIndex[item.URI]; ok {
+					if _, statErr := os.Stat(artPath); statErr == nil {
+						if localURL := b.embeddedArtworkHTTPURL(item.URI); localURL != "" {
+							item.AlbumArtURL = localURL
+							normalized = append(normalized, item)
+							continue
+						}
+					}
+				}
+			}
+			if proxied := b.artworkHTTPURL(item.AlbumArtURL); proxied != "" {
+				item.AlbumArtURL = proxied
+			}
+			normalized = append(normalized, item)
+		}
+		items = normalized
+	}
+
 	tracksJSON := "[]"
 	if encoded, encErr := json.Marshal(items); encErr == nil {
 		tracksJSON = string(encoded)
@@ -1574,11 +1962,18 @@ func (b *SpotifyBridge) downloadTrack(raw string) {
 	b.set("isDownloadingTrack", false)
 	if len(results) > 0 && strings.TrimSpace(results[0].OutputPath) != "" {
 		downloadedPath := strings.TrimSpace(results[0].OutputPath)
+		embeddedArtPath := cacheEmbeddedArtworkForTrackURI(trackURI, downloadedPath)
 		b.mu.Lock()
 		if b.downloadedByURI == nil {
 			b.downloadedByURI = make(map[string]string)
 		}
+		if b.downloadedArtByURI == nil {
+			b.downloadedArtByURI = make(map[string]string)
+		}
 		b.downloadedByURI[trackURI] = downloadedPath
+		if embeddedArtPath != "" {
+			b.downloadedArtByURI[trackURI] = embeddedArtPath
+		}
 		for i := range b.trackItems {
 			if b.trackItems[i].URI == trackURI {
 				b.trackItems[i].Downloaded = true
