@@ -64,4 +64,12 @@ android {
         targetSdkVersion qtTargetSdkVersion
         ndk.abiFilters = qtTargetAbiList.split(",")
     }
+
+    packagingOptions {
+        jniLibs {
+            // Ensure native libraries are extracted to filesystem paths under /data/app.
+            // We need this to execute bundled libffmpeg_cli.so as a CLI entrypoint.
+            useLegacyPackaging true
+        }
+    }
 }
