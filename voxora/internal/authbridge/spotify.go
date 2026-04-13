@@ -22,6 +22,7 @@ import (
 	"time"
 
 	libspotdl "github.com/McMelonTV/Voxora/libspotd"
+	"github.com/dhowden/tag"
 	qt "github.com/mappu/miqt/qt6"
 	"github.com/mappu/miqt/qt6/qml"
 )
@@ -56,10 +57,6 @@ type SpotifyBridge struct {
 	streamHTTPListener net.Listener
 	streamHTTPServer   *http.Server
 	streamHTTPBaseURL  string
-}
-
-type downloadedTrackIndex struct {
-	Tracks map[string]string `json:"tracks"`
 }
 
 func NewSpotifyBridge() *SpotifyBridge {
@@ -1276,17 +1273,63 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	b.set("trackListStatus", "Playing streamed \""+trackName+"\"")
 }
 
-func downloadIndexPath() string {
-	configDir, err := os.UserConfigDir()
-	if err != nil || strings.TrimSpace(configDir) == "" {
-		return ""
-	}
-	return filepath.Join(configDir, "voxora", "downloaded_tracks.json")
-}
-
 var trackURIRegex = regexp.MustCompile(`spotify:track:[A-Za-z0-9]+`)
 
 func extractTrackURIFromMediaTags(filePath string) string {
+	log := newBridgeLogger().WithField("component", "download_scan").WithField("file", filePath)
+
+	file, openErr := os.Open(filePath)
+	if openErr == nil {
+		meta, metaErr := tag.ReadFrom(file)
+		_ = file.Close()
+		if metaErr == nil {
+			fields := map[string]string{}
+			if v := strings.TrimSpace(meta.Title()); v != "" {
+				fields["title"] = v
+			}
+			if v := strings.TrimSpace(meta.Artist()); v != "" {
+				fields["artist"] = v
+			}
+			if v := strings.TrimSpace(meta.Album()); v != "" {
+				fields["album"] = v
+			}
+			if v := strings.TrimSpace(meta.Genre()); v != "" {
+				fields["genre"] = v
+			}
+			if c := meta.Raw(); c != nil {
+				for k, rawV := range c {
+					key := strings.ToLower(strings.TrimSpace(k))
+					if key == "" {
+						continue
+					}
+					value := strings.TrimSpace(fmt.Sprintf("%v", rawV))
+					if value == "" {
+						continue
+					}
+					fields[key] = value
+				}
+			}
+
+			if len(fields) > 0 {
+				log.WithField("tags", fields).Debug("metadata tags read from file")
+			} else {
+				log.Debug("metadata parser found no tags")
+			}
+
+			for _, v := range fields {
+				if match := strings.TrimSpace(trackURIRegex.FindString(v)); match != "" {
+					log.WithField("track_uri", match).Debug("extracted spotify URI from native metadata tags")
+					return match
+				}
+			}
+			log.Debug("native metadata tags found but no spotify URI present")
+		} else {
+			log.WithError(metaErr).Debug("native metadata parser failed")
+		}
+	} else {
+		log.WithError(openErr).Debug("failed opening file for native metadata parser")
+	}
+
 	cmd := exec.Command(
 		"ffprobe",
 		"-v", "error",
@@ -1295,10 +1338,45 @@ func extractTrackURIFromMediaTags(filePath string) string {
 		filePath,
 	)
 	out, err := cmd.Output()
-	if err != nil {
+	if err == nil {
+		match := trackURIRegex.FindString(string(out))
+		if strings.TrimSpace(match) == "" {
+			log.Debug("ffprobe succeeded but no spotify URI found in tags")
+		} else {
+			log.WithField("track_uri", strings.TrimSpace(match)).Debug("extracted spotify URI using ffprobe")
+		}
+		return strings.TrimSpace(match)
+	}
+	log.WithError(err).Debug("ffprobe failed, falling back to ffmpeg metadata")
+
+	ffmpegBin := strings.TrimSpace(os.Getenv("VOXORA_FFMPEG_PATH"))
+	if ffmpegBin == "" {
+		ffmpegBin = bridgePrepareFFmpegEnv()
+	}
+	if ffmpegBin == "" {
+		ffmpegBin = "ffmpeg"
+	}
+
+	// Android often lacks ffprobe in PATH. Fallback to ffmpeg ffmetadata output,
+	// which still includes embedded comment/description tags with spotify:track URI.
+	metaCmd := exec.Command(
+		ffmpegBin,
+		"-v", "error",
+		"-i", filePath,
+		"-f", "ffmetadata",
+		"-",
+	)
+	metaOut, metaErr := metaCmd.Output()
+	if metaErr != nil {
+		log.WithError(metaErr).WithField("ffmpeg_bin", ffmpegBin).Debug("ffmpeg metadata fallback failed")
 		return ""
 	}
-	match := trackURIRegex.FindString(string(out))
+	match := trackURIRegex.FindString(string(metaOut))
+	if strings.TrimSpace(match) == "" {
+		log.WithField("ffmpeg_bin", ffmpegBin).Debug("ffmpeg metadata fallback found no spotify URI")
+	} else {
+		log.WithField("ffmpeg_bin", ffmpegBin).WithField("track_uri", strings.TrimSpace(match)).Debug("extracted spotify URI using ffmpeg metadata fallback")
+	}
 	return strings.TrimSpace(match)
 }
 
@@ -1313,14 +1391,20 @@ func isScannableAudioFile(path string) bool {
 }
 
 func scanDownloadedAudioTags(downloadDir string) map[string]string {
+	log := newBridgeLogger().WithField("component", "download_scan").WithField("download_dir", downloadDir)
 	result := make(map[string]string)
 	dir := strings.TrimSpace(downloadDir)
 	if dir == "" {
+		log.Debug("download scan skipped: empty directory")
 		return result
 	}
 
+	inspected := 0
+	matches := 0
+
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			log.WithError(err).WithField("path", path).Debug("download scan walk error")
 			return nil
 		}
 		if d.IsDir() {
@@ -1329,42 +1413,27 @@ func scanDownloadedAudioTags(downloadDir string) map[string]string {
 		if !isScannableAudioFile(path) {
 			return nil
 		}
+		inspected++
 
 		uri := extractTrackURIFromMediaTags(path)
 		if uri == "" {
+			log.WithField("file", path).Debug("audio file has no spotify URI tag")
 			return nil
 		}
 		result[uri] = path
+		matches++
+		log.WithField("file", path).WithField("track_uri", uri).Debug("recognized downloaded track from metadata")
 		return nil
 	})
+
+	log.WithField("inspected_files", inspected).WithField("matched_tracks", matches).Debug("completed downloaded tracks scan")
 
 	return result
 }
 
 func (b *SpotifyBridge) loadDownloadedIndex() {
-	path := downloadIndexPath()
+	log := newBridgeLogger().WithField("component", "download_scan")
 	clean := make(map[string]string)
-	if strings.TrimSpace(path) != "" {
-		raw, err := os.ReadFile(path)
-		if err == nil {
-			var idx downloadedTrackIndex
-			if json.Unmarshal(raw, &idx) == nil {
-				for uri, filePath := range idx.Tracks {
-					u := strings.TrimSpace(uri)
-					p := strings.TrimSpace(filePath)
-					if u == "" || p == "" {
-						continue
-					}
-					if _, statErr := os.Stat(p); statErr == nil {
-						clean[u] = p
-					}
-				}
-			}
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			// ignore malformed/unreadable index and continue with disk scan.
-		}
-	}
-
 	for uri, filePath := range scanDownloadedAudioTags(defaultDownloadDir()) {
 		clean[uri] = filePath
 	}
@@ -1373,32 +1442,7 @@ func (b *SpotifyBridge) loadDownloadedIndex() {
 	b.downloadedByURI = clean
 	b.mu.Unlock()
 
-	_ = b.saveDownloadedIndex()
-}
-
-func (b *SpotifyBridge) saveDownloadedIndex() error {
-	path := downloadIndexPath()
-	if strings.TrimSpace(path) == "" {
-		return nil
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	b.mu.Lock()
-	copyMap := make(map[string]string, len(b.downloadedByURI))
-	for uri, filePath := range b.downloadedByURI {
-		copyMap[uri] = filePath
-	}
-	b.mu.Unlock()
-
-	encoded, err := json.MarshalIndent(downloadedTrackIndex{Tracks: copyMap}, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(path, encoded, 0o644)
+	log.WithField("recognized_tracks", len(clean)).Debug("loaded downloaded tracks from metadata scan")
 }
 
 func (b *SpotifyBridge) annotateDownloadedTracks(items []libspotdl.LibraryTrackSummary) []libspotdl.LibraryTrackSummary {
@@ -1432,7 +1476,6 @@ func (b *SpotifyBridge) annotateDownloadedTracks(items []libspotdl.LibraryTrackS
 			delete(b.downloadedByURI, uri)
 		}
 		b.mu.Unlock()
-		_ = b.saveDownloadedIndex()
 	}
 	return out
 }
@@ -1545,7 +1588,6 @@ func (b *SpotifyBridge) downloadTrack(raw string) {
 		}
 		updatedTracks := append([]libspotdl.LibraryTrackSummary(nil), b.trackItems...)
 		b.mu.Unlock()
-		_ = b.saveDownloadedIndex()
 		b.publishTrackList(updatedTracks)
 		b.set("trackListStatus", "Downloaded \""+trackName+"\" to "+results[0].OutputPath)
 		return

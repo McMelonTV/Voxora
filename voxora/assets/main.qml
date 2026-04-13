@@ -509,33 +509,18 @@ Window {
         spacing: 0
 
         Rectangle {
+            id: topControls
             width: parent.width
             color: "#161616"
             border.color: "#2b2b2b"
             border.width: 1
-            implicitHeight: infoColumn.implicitHeight + 20
+            implicitHeight: controlsColumn.implicitHeight + 20
 
             Column {
-                id: infoColumn
+                id: controlsColumn
                 anchors.fill: parent
                 anchors.margins: 10
-                spacing: 4
-
-                Text {
-                    text: "Platform: " + graphicsPlatform
-                    color: "#f3f3f3"
-                }
-
-                Text {
-                    text: "Graphics API: " + graphicsApi
-                    color: "#d7d7d7"
-                }
-
-                Text {
-                    text: "Renderer: " + graphicsRenderer
-                    color: "#d7d7d7"
-                    wrapMode: Text.WrapAnywhere
-                }
+                spacing: 6
 
                 Row {
                     spacing: 8
@@ -550,19 +535,13 @@ Window {
                         text: spotifyAuthBridge.statusText
                         color: "#9ad0ff"
                         wrapMode: Text.WrapAnywhere
-                        width: Math.max(120, infoColumn.width - 170)
+                        width: Math.max(120, controlsColumn.width - 170)
                     }
                 }
 
                 Text {
                     text: spotifyAuthBridge.libraryStatus
                     color: "#9ad0ff"
-                    wrapMode: Text.WrapAnywhere
-                }
-
-                Text {
-                    text: spotifyAuthBridge.likedSongsName + ": " + spotifyAuthBridge.likedSongsCount + " tracks"
-                    color: "#cfd8e6"
                     wrapMode: Text.WrapAnywhere
                 }
 
@@ -576,7 +555,7 @@ Window {
 
         Item {
             width: parent.width
-            height: parent.height - infoColumn.parent.height
+            height: parent.height - topControls.height
 
             Loader {
                 id: contentLoader
@@ -818,11 +797,35 @@ Window {
                             width: Math.max(120, parent.width - 260)
                             spacing: 2
 
-                            Text {
-                                text: modelData.Name || modelData.URI || "Unknown track"
-                                color: "#f0f5ff"
-                                elide: Text.ElideRight
+                            Row {
                                 width: parent.width
+                                spacing: 6
+
+                                Text {
+                                    text: modelData.Name || modelData.URI || "Unknown track"
+                                    color: "#f0f5ff"
+                                    elide: Text.ElideRight
+                                    width: modelData.DownloadedPath ? Math.max(80, parent.width - downloadedBadge.width - 8) : parent.width
+                                }
+
+                                Rectangle {
+                                    id: downloadedBadge
+                                    visible: !!modelData.DownloadedPath
+                                    radius: 4
+                                    color: "#1f7a3a"
+                                    border.color: "#36a85a"
+                                    border.width: 1
+                                    implicitHeight: 18
+                                    implicitWidth: downloadedText.implicitWidth + 10
+
+                                    Text {
+                                        id: downloadedText
+                                        anchors.centerIn: parent
+                                        text: "Downloaded"
+                                        color: "#e9ffe9"
+                                        font.pixelSize: 10
+                                    }
+                                }
                             }
 
                             Text {
