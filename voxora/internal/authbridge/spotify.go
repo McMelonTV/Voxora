@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +52,10 @@ type SpotifyBridge struct {
 	activeStreamFIFO     string
 	activeStreamWrite    *os.File
 	streamBufferedLatest int64
+
+	streamHTTPListener net.Listener
+	streamHTTPServer   *http.Server
+	streamHTTPBaseURL  string
 }
 
 type downloadedTrackIndex struct {
@@ -58,6 +65,7 @@ type downloadedTrackIndex struct {
 func NewSpotifyBridge() *SpotifyBridge {
 	props := qml.NewQQmlPropertyMap()
 	b := &SpotifyBridge{props: props, downloadedByURI: make(map[string]string)}
+	b.startStreamHTTPServer()
 
 	b.set("state", "idle")
 	b.set("statusText", "Spotify auth: idle")
@@ -85,6 +93,7 @@ func NewSpotifyBridge() *SpotifyBridge {
 	b.set("streamPlayReadyNonce", 0)
 	b.set("streamCacheReady", false)
 	b.set("streamCachePath", "")
+	b.set("streamCacheFilePath", "")
 	b.set("streamBufferedBytes", int64(0))
 	b.set("streamBufferedTotal", int64(0))
 	b.set("clearStreamNonce", 0)
@@ -156,6 +165,88 @@ func (b *SpotifyBridge) Close() {
 		b.sharedDownloader = nil
 		b.sharedCredsFile = ""
 	}
+	if b.streamHTTPServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = b.streamHTTPServer.Shutdown(ctx)
+		cancel()
+		b.streamHTTPServer = nil
+	}
+	if b.streamHTTPListener != nil {
+		_ = b.streamHTTPListener.Close()
+		b.streamHTTPListener = nil
+	}
+	b.streamHTTPBaseURL = ""
+}
+
+func (b *SpotifyBridge) startStreamHTTPServer() {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream", b.handleStreamHTTP)
+
+	server := &http.Server{Handler: mux}
+
+	b.mu.Lock()
+	b.streamHTTPListener = listener
+	b.streamHTTPServer = server
+	b.streamHTTPBaseURL = "http://" + listener.Addr().String()
+	b.mu.Unlock()
+
+	go func() {
+		_ = server.Serve(listener)
+	}()
+}
+
+func (b *SpotifyBridge) streamHTTPURL(kind, uri string) string {
+	b.mu.Lock()
+	base := b.streamHTTPBaseURL
+	b.mu.Unlock()
+	if strings.TrimSpace(base) == "" {
+		return ""
+	}
+	if strings.TrimSpace(uri) == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s/stream?kind=%s&uri=%s", base, kind, url.QueryEscape(uri))
+}
+
+func (b *SpotifyBridge) handleStreamHTTP(w http.ResponseWriter, r *http.Request) {
+	kind := strings.TrimSpace(r.URL.Query().Get("kind"))
+	uri := strings.TrimSpace(r.URL.Query().Get("uri"))
+	if kind == "" || uri == "" {
+		http.Error(w, "missing kind/uri", http.StatusBadRequest)
+		return
+	}
+
+	var path string
+	switch kind {
+	case "play":
+		path = streamPartPathForURI(uri)
+	case "cache":
+		path = streamCachePathForURI(uri)
+	default:
+		http.Error(w, "invalid kind", http.StatusBadRequest)
+		return
+	}
+
+	if strings.TrimSpace(path) == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+
+	w.Header().Set("Content-Type", "audio/ogg")
+	w.Header().Set("Accept-Ranges", "bytes")
+	http.ServeContent(w, r, filepath.Base(path), time.Now(), file)
 }
 
 func (b *SpotifyBridge) startFlow() {
@@ -724,6 +815,7 @@ func (b *SpotifyBridge) clearStreamCache() {
 	b.set("streamPlayPath", "")
 	b.set("streamCacheReady", false)
 	b.set("streamCachePath", "")
+	b.set("streamCacheFilePath", "")
 	b.mu.Lock()
 	b.streamBufferedLatest = 0
 	b.mu.Unlock()
@@ -808,11 +900,16 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 
 	outputPath := streamCachePathForURI(trackURI)
 	partPath := streamPartPathForURI(trackURI)
-	activeOutputPath := outputPath
-	if runtime.GOOS == "android" {
-		activeOutputPath = partPath
-	}
+	activeOutputPath := partPath
 	doneMarkerPath := streamCacheDoneMarkerPathForStream(outputPath)
+	playURL := b.streamHTTPURL("play", trackURI)
+	cacheURL := b.streamHTTPURL("cache", trackURI)
+	if strings.TrimSpace(playURL) == "" {
+		playURL = activeOutputPath
+	}
+	if strings.TrimSpace(cacheURL) == "" {
+		cacheURL = outputPath
+	}
 	if isUsableCachedStream(outputPath) {
 		_ = os.Chtimes(outputPath, time.Now(), time.Now())
 		if info, statErr := os.Stat(outputPath); statErr == nil {
@@ -828,10 +925,11 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 			b.streamReadyNonce++
 			nonce := b.streamReadyNonce
 			b.mu.Unlock()
-			b.set("streamPlayPath", outputPath)
+			b.set("streamPlayPath", cacheURL)
 			b.set("streamPlayReadyNonce", nonce)
 			b.set("streamCacheReady", true)
-			b.set("streamCachePath", outputPath)
+			b.set("streamCachePath", cacheURL)
+			b.set("streamCacheFilePath", outputPath)
 			b.set("isStreamingTrack", false)
 			b.set("trackListStatus", "Playing cached stream \""+trackName+"\"")
 			return
@@ -843,11 +941,9 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	if doneMarkerPath != "" {
 		_ = os.Remove(doneMarkerPath)
 	}
-	if activeOutputPath != outputPath {
-		_ = os.Remove(activeOutputPath)
-	}
+	_ = os.Remove(activeOutputPath)
 
-	useFIFO := runtime.GOOS != "android"
+	useFIFO := false
 	fifoPath := ""
 	if useFIFO {
 		fifoPath = streamFIFOPathForURI(trackURI)
@@ -1092,14 +1188,15 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 					b.streamReadyNonce++
 					nonce := b.streamReadyNonce
 					b.mu.Unlock()
-					b.set("streamPlayPath", activeOutputPath)
+					b.set("streamPlayPath", playURL)
 					b.set("streamPlayReadyNonce", nonce)
 				} else {
 					b.mu.Unlock()
 				}
 			}
 			b.set("streamCacheReady", true)
-			b.set("streamCachePath", outputPath)
+			b.set("streamCachePath", cacheURL)
+			b.set("streamCacheFilePath", outputPath)
 			b.set("isStreamingTrack", false)
 			b.set("trackListStatus", "Playing streamed \""+trackName+"\"")
 		}
@@ -1156,7 +1253,8 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 			}
 		}
 		b.set("streamCacheReady", true)
-		b.set("streamCachePath", outputPath)
+		b.set("streamCachePath", cacheURL)
+		b.set("streamCacheFilePath", outputPath)
 	}
 	if info, statErr := os.Stat(outputPath); statErr == nil {
 		b.mu.Lock()
@@ -1166,7 +1264,8 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 		b.set("streamBufferedTotal", info.Size())
 	}
 	b.set("streamCacheReady", true)
-	b.set("streamCachePath", outputPath)
+	b.set("streamCachePath", cacheURL)
+	b.set("streamCacheFilePath", outputPath)
 
 	b.mu.Lock()
 	if b.streamOpID == opID {

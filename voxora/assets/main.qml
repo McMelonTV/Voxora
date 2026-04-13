@@ -22,7 +22,6 @@ Window {
     property bool streamSourceSwitching: false
     property bool streamSourceSwitchShouldPlay: false
     property int lastPartRefreshAtMs: -1000000
-    property bool partFinalizeRefreshDone: false
     property int expectedDurationMs: 0
     property int effectiveDurationMs: Math.max(localPlayer.duration, expectedDurationMs)
     property int pendingResumePositionMs: -1
@@ -91,7 +90,7 @@ Window {
         if (!path) {
             return ""
         }
-        if (path.startsWith("file://")) {
+        if (path.startsWith("file://") || path.startsWith("http://") || path.startsWith("https://")) {
             return path
         }
         return "file://" + path
@@ -108,7 +107,7 @@ Window {
         if (!path) {
             return false
         }
-        return path.endsWith(".stream.play.ogg") || path.endsWith(".stream.ogg.part")
+        return path.endsWith(".stream.play.ogg") || path.endsWith(".stream.ogg.part") || (path.indexOf("/stream?kind=play&") !== -1)
     }
 
     function recoverStreamingPlayback() {
@@ -129,7 +128,7 @@ Window {
         var currentSource = localPlayer.source ? localPlayer.source.toString() : ""
         var targetSource = toFileUrl(targetPath)
         var isLiveFifo = targetPath.endsWith(".live.fifo")
-        var cachePath = spotifyAuthBridge.streamCachePath || ""
+        var cachePath = spotifyAuthBridge.streamCacheFilePath || spotifyAuthBridge.streamCachePath || ""
         var usingCachePath = cachePath.length > 0 && targetPath === cachePath
         if (currentSource.length === 0 && targetSource.length > 0) {
             localPlayer.source = targetSource
@@ -192,7 +191,7 @@ Window {
             return
         }
 
-        var cachePath = spotifyAuthBridge.streamCachePath || ""
+        var cachePath = spotifyAuthBridge.streamCacheFilePath || spotifyAuthBridge.streamCachePath || ""
         var isLiveFifo = currentPlayingPath.endsWith(".live.fifo")
         var isPartStream = isPartStreamPath(currentPlayingPath)
 
@@ -348,9 +347,6 @@ Window {
                     if (bufferedMs > 0 && localPlayer.position >= Math.max(0, bufferedMs - 2500)) {
                         refreshPartStreamSource(localPlayer.position)
                     }
-                } else if (!spotifyAuthBridge.isStreamingTrack && !partFinalizeRefreshDone && localPlayer.position > 0) {
-                    partFinalizeRefreshDone = true
-                    refreshPartStreamSource(localPlayer.position)
                 }
             }
 
@@ -375,7 +371,7 @@ Window {
                 if (streamSourceSwitching) {
                     return
                 }
-                var cachePath = spotifyAuthBridge.streamCachePath || ""
+                var cachePath = spotifyAuthBridge.streamCacheFilePath || spotifyAuthBridge.streamCachePath || ""
                 var bufferedNow = Number(spotifyAuthBridge.streamBufferedBytes) || 0
                 var likelyNaturalEnd = effectiveDurationMs > 0 && localPlayer.position >= (effectiveDurationMs - 1500)
                 var isPotentialStreamStop = currentPlayingPath.length > 0 && (
@@ -476,7 +472,6 @@ Window {
                     pendingResumeAttempts = 0
                     resumeSeekTimer.stop()
                     lastPartRefreshAtMs = -1000000
-                    partFinalizeRefreshDone = false
                     streamOpenBufferedBytes = Number(spotifyAuthBridge.streamBufferedBytes) || 0
                     bufferedProgressLatched = 0
                     localPlayer.source = ""
