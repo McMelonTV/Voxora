@@ -7,6 +7,20 @@ qt_android_source=""
 qt_android_deploy_path="./.qt-android-runtime"
 android_project_dir="./android-project"
 selected_android_abis=()
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root=""
+
+detect_repo_root() {
+  local candidate
+  for candidate in "$PWD" "$PWD/.." "$script_dir/.."; do
+    if [ -f "${candidate}/flake.nix" ] && [ -f "${candidate}/voxora/go.mod" ]; then
+      (cd "${candidate}" && pwd)
+      return 0
+    fi
+  done
+
+  (cd "${script_dir}/.." && pwd)
+}
 
 get_app_name() {
   basename "$(pwd)"
@@ -62,6 +76,40 @@ cxx_for_abi() {
       die "Unsupported Android ABI: $1"
       ;;
   esac
+}
+
+ffmpeg_source_for_abi() {
+  local abi="$1"
+  local env_path=""
+
+  case "${abi}" in
+    arm64-v8a)
+      env_path="${VOXORA_ANDROID_FFMPEG_ARM64:-}"
+      ;;
+    x86_64)
+      env_path="${VOXORA_ANDROID_FFMPEG_X86_64:-}"
+      ;;
+    *)
+      die "Unsupported Android ABI: ${abi}"
+      ;;
+  esac
+
+  if [ -n "${env_path}" ]; then
+    printf '%s\n' "${env_path}"
+    return 0
+  fi
+
+  if [ -f "${repo_root}/third_party/ffmpeg/android/${abi}/ffmpeg" ]; then
+    printf '%s\n' "${repo_root}/third_party/ffmpeg/android/${abi}/ffmpeg"
+    return 0
+  fi
+
+  if [ -f "${repo_root}/tools/ffmpeg/${abi}/ffmpeg" ]; then
+    printf '%s\n' "${repo_root}/tools/ffmpeg/${abi}/ffmpeg"
+    return 0
+  fi
+
+  printf '%s\n' ""
 }
 
 ar_for_abi() {
@@ -293,6 +341,26 @@ seed_qt_runtime_for_abi() {
   done < <(find "${QT_ANDROID}/lib" "${QT_ANDROID}/plugins" "${QT_ANDROID}/qml" -type f -name "*_${abi}.so" -print0)
 }
 
+bundle_ffmpeg_for_abi() {
+  local abi="$1"
+  local src
+  local dst
+
+  src="$(ffmpeg_source_for_abi "${abi}")"
+  if [ -z "${src}" ]; then
+    printf '%s\n' "[voxora] ffmpeg not bundled for ${abi}; set VOXORA_ANDROID_FFMPEG_ARM64/VOXORA_ANDROID_FFMPEG_X86_64 or provide third_party/ffmpeg/android/${abi}/ffmpeg" >&2
+    return 0
+  fi
+
+  if [ ! -f "${src}" ]; then
+    die "Configured ffmpeg path for ${abi} does not exist: ${src}"
+  fi
+
+  dst="${android_project_dir}/libs/${abi}/libffmpeg_cli.so"
+  cp -f "${src}" "${dst}"
+  chmod 0755 "${dst}"
+}
+
 bundle_qml_modules() {
   local bundle_dir scanner_output relative_path module_path
 
@@ -410,6 +478,8 @@ build_apk() {
 main() {
   local abi
 
+  repo_root="$(detect_repo_root)"
+
   require_is_main_package
   load_signing_env
   load_selected_abis
@@ -421,6 +491,7 @@ main() {
     build_stub_library "${abi}"
     build_go_library "${abi}"
     seed_qt_runtime_for_abi "${abi}"
+    bundle_ffmpeg_for_abi "${abi}"
   done
 
   bundle_qml_modules

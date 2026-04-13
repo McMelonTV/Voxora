@@ -534,10 +534,13 @@ func (b *SpotifyBridge) sharedDownloaderFor(ctx context.Context) (*libspotdl.Dow
 		_ = old.Close()
 	}
 
+	ffmpegPath := bridgePrepareFFmpegEnv()
 	d, err := libspotdl.New(ctx, libspotdl.Config{
-		Auth:   libspotdl.AuthConfig{CredentialsFile: credentialsFile},
-		Logger: log,
+		Auth:       libspotdl.AuthConfig{CredentialsFile: credentialsFile},
+		Logger:     log,
+		FFmpegPath: ffmpegPath,
 	})
+	log.WithField("ffmpeg_path", ffmpegPath).WithField("path", os.Getenv("PATH")).Debug("resolved ffmpeg path for downloader")
 	if err != nil {
 		log.WithError(err).Error("failed to create shared downloader")
 		return nil, err

@@ -29,3 +29,20 @@ func bridgeCredentialsFile() string {
 	_ = os.Setenv("LIBSPOTDL_CREDENTIALS_FILE", path)
 	return path
 }
+
+func bridgeFFmpegPath() string {
+	if envPath := strings.TrimSpace(os.Getenv("VOXORA_FFMPEG_PATH")); envPath != "" {
+		if info, err := os.Stat(envPath); err == nil && !info.IsDir() {
+			return envPath
+		}
+	}
+	return ""
+}
+
+func bridgePrepareFFmpegEnv() string {
+	path := bridgeFFmpegPath()
+	if path != "" {
+		_ = os.Setenv("VOXORA_FFMPEG_PATH", path)
+	}
+	return path
+}

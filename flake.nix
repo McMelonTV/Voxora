@@ -367,6 +367,235 @@
         '';
       };
 
+      voxoraAndroidFfmpegBuild = pkgs.writeShellApplication {
+        name = "voxora-android-ffmpeg-build";
+        runtimeInputs = [
+          pkgs.git
+          pkgs.coreutils
+          pkgs.gnugrep
+          pkgs.gnused
+          pkgs.gawk
+          pkgs.findutils
+          pkgs.bash
+          pkgs.which
+          pkgs.gnumake
+          pkgs.cmake
+          pkgs.pkg-config
+          pkgs.perl
+          pkgs.python3
+          pkgs.nasm
+          pkgs.yasm
+          pkgs.autoconf
+          pkgs.automake
+          pkgs.libtool
+          pkgs.meson
+          pkgs.ninja
+          pkgs.binutils
+          androidPackages.androidsdk
+          pkgs.jdk17
+        ];
+        text = ''
+          set -euo pipefail
+          ${repoRootCheck}
+          ${androidSdkEnv}
+
+          export ANDROID_SDK_HOME="$ANDROID_SDK_ROOT"
+          export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
+
+          repo_url="''${VOXORA_FFMPEG_ANDROID_BUILD_REPO:-https://github.com/bookzhan/ffmpeg-android-build.git}"
+          repo_ref="''${VOXORA_FFMPEG_ANDROID_BUILD_REF:-master}"
+          work_dir="$PWD/.ffmpeg-android-build"
+          src_dir="$work_dir/src"
+
+          mkdir -p "$work_dir"
+
+          if [ ! -d "$src_dir/.git" ]; then
+            git clone "$repo_url" "$src_dir"
+          fi
+
+          cd "$src_dir"
+          git fetch --tags origin
+          git checkout "$repo_ref"
+          git pull --ff-only origin "$repo_ref" || true
+
+          if [ ! -x "./ffmpeg-android-maker.sh" ]; then
+            printf '%s\n' "ffmpeg-android-maker.sh was not found in $src_dir" >&2
+            exit 1
+          fi
+
+          printf '%s\n' "Using ffmpeg-android-build repo: $repo_url ($repo_ref)"
+          printf '%s\n' "ANDROID_SDK_HOME=$ANDROID_SDK_HOME"
+          printf '%s\n' "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+
+          has_arg() {
+            local wanted="$1"
+            shift || true
+            local arg
+            for arg in "$@"; do
+              if [ "$arg" = "$wanted" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          maker_args=("$@")
+          # Voxora post-process targets MP3 and expects libmp3lame.
+          if ! has_arg "--enable-libmp3lame" "''${maker_args[@]}"; then
+            maker_args+=("--enable-libmp3lame")
+          fi
+
+          # bookzhan defaults to building a merged shared object and may disable CLI tools.
+          # Force-enable ffmpeg CLI so downstream can execute a real binary on device.
+          if [ "''${VOXORA_FFMPEG_ENABLE_CLI:-1}" = "1" ]; then
+            ffmpeg_build_script="./scripts/ffmpeg/build.sh"
+            if [ -f "$ffmpeg_build_script" ]; then
+              sed -i \
+                -e 's/--disable-ffmpeg/--enable-ffmpeg/g' \
+                -e 's/--disable-ffprobe/--enable-ffprobe/g' \
+                "$ffmpeg_build_script"
+
+              # Spotify downloads are OGG/Vorbis. Keep the custom slim build, but
+              # guarantee required demux/parser flags are present for post-processing.
+              if ! grep -q -- '--enable-demuxer=ogg' "$ffmpeg_build_script"; then
+                sed -i "/--enable-demuxer=mp3/a\\
+  --enable-demuxer=ogg \\\\" "$ffmpeg_build_script"
+              fi
+              if grep -q -- '--disable-parsers' "$ffmpeg_build_script" && ! grep -q -- '--enable-parser=vorbis' "$ffmpeg_build_script"; then
+                sed -i "/--disable-parsers/a\\
+  --enable-parser=vorbis \\\\" "$ffmpeg_build_script"
+              fi
+            fi
+          fi
+
+          exec bash ./ffmpeg-android-maker.sh "''${maker_args[@]}"
+        '';
+      };
+
+      voxoraAndroidFfmpegStage = pkgs.writeShellApplication {
+        name = "voxora-android-ffmpeg-stage";
+        runtimeInputs = [
+          pkgs.coreutils
+          pkgs.findutils
+          pkgs.gnugrep
+          pkgs.file
+          pkgs.binutils
+          pkgs.bash
+        ];
+        text = ''
+          set -euo pipefail
+          ${repoRootCheck}
+
+          src_root="''${VOXORA_FFMPEG_ANDROID_BUILD_ROOT:-$PWD/.ffmpeg-android-build/src}"
+          dst_root="$PWD/third_party/ffmpeg/android"
+
+          map_abi() {
+            case "$1" in
+              arm64-v8a|x86_64|x86|armeabi-v7a) printf '%s\n' "$1" ;;
+              arm64) printf '%s\n' "arm64-v8a" ;;
+              amd64) printf '%s\n' "x86_64" ;;
+              *)
+                printf '%s\n' "Unsupported ABI: $1" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          find_source_for_abi() {
+            local abi="$1"
+            local src=""
+
+            for candidate in \
+              "$src_root/build/ffmpeg/$abi/bin/ffmpeg" \
+              "$src_root/build/ffmpeg/$abi/ffmpeg" \
+              "$src_root/output/bin/$abi/ffmpeg"; do
+              if [ -f "$candidate" ]; then
+                src="$candidate"
+                break
+              fi
+            done
+
+            if [ -z "$src" ] && [ "''${VOXORA_FFMPEG_ALLOW_SHARED_LIB_FALLBACK:-0}" = "1" ]; then
+              for candidate in \
+                "$src_root/output/lib/$abi/libbzffmpeg.so" \
+                "$src_root/build/ffmpeg/$abi/lib/libbzffmpeg.so"; do
+                if [ -f "$candidate" ]; then
+                  src="$candidate"
+                  break
+                fi
+              done
+            fi
+
+            printf '%s\n' "$src"
+          }
+
+          is_probably_runnable_cli() {
+            local path="$1"
+            local entry
+
+            entry="$(readelf -h "$path" 2>/dev/null | sed -n 's/^  Entry point address:\s*//p' | head -n1 | tr -d '[:space:]')"
+            [ -n "$entry" ] || return 1
+            [ "$entry" != "0x0" ] || return 1
+            [ "$entry" != "0" ] || return 1
+            return 0
+          }
+
+          stage_one() {
+            local abi="$1"
+            local src
+            local dst_dir
+            local dst
+
+            src="$(find_source_for_abi "$abi")"
+            if [ -z "$src" ]; then
+              printf '%s\n' "No ffmpeg artifact found for ABI $abi under $src_root" >&2
+              printf '%s\n' "Expected a real ffmpeg CLI binary. Re-run: nix run .#android-ffmpeg-build" >&2
+              printf '%s\n' "If you still want to stage libbzffmpeg.so as fallback, set VOXORA_FFMPEG_ALLOW_SHARED_LIB_FALLBACK=1." >&2
+              return 1
+            fi
+
+            if ! is_probably_runnable_cli "$src"; then
+              printf '%s\n' "Refusing to stage non-runnable ffmpeg artifact for ABI $abi: $src" >&2
+              printf '%s\n' "This artifact has no executable entry point and can crash when invoked as CLI." >&2
+              printf '%s\n' "Re-run ffmpeg build with CLI enabled (default), or set VOXORA_FFMPEG_ALLOW_SHARED_LIB_FALLBACK=1 to override." >&2
+              return 1
+            fi
+
+            dst_dir="$dst_root/$abi"
+            dst="$dst_dir/ffmpeg"
+            mkdir -p "$dst_dir"
+            cp -f "$src" "$dst"
+            chmod 0755 "$dst"
+
+            printf '%s\n' "Staged $abi: $src -> $dst"
+          }
+
+          if [ ! -d "$src_root" ]; then
+            printf '%s\n' "Missing ffmpeg build root: $src_root" >&2
+            printf '%s\n' "Run nix run .#android-ffmpeg-build first, or set VOXORA_FFMPEG_ANDROID_BUILD_ROOT." >&2
+            exit 1
+          fi
+
+          abi_list="''${VOXORA_ANDROID_ABIS:-arm64-v8a,x86_64}"
+          IFS=',' read -r -a raw_abis <<< "$abi_list"
+
+          staged=0
+          for raw in "''${raw_abis[@]}"; do
+            abi="$(map_abi "''${raw//[[:space:]]/}")"
+            if stage_one "$abi"; then
+              staged=$((staged + 1))
+            fi
+          done
+
+          if [ "$staged" -eq 0 ]; then
+            printf '%s\n' "No ABI artifacts were staged." >&2
+            exit 1
+          fi
+
+          printf '%s\n' "Staged $staged ffmpeg artifact(s) under $dst_root"
+        '';
+      };
+
       app = program: description: {
         type = "app";
         inherit program;
@@ -382,6 +611,8 @@
         "desktop-build" = voxoraDesktopBuild;
         "android-build" = voxoraAndroidBuild;
         "android-keystore-setup" = voxoraAndroidKeystoreSetup;
+        "android-ffmpeg-build" = voxoraAndroidFfmpegBuild;
+        "android-ffmpeg-stage" = voxoraAndroidFfmpegStage;
         "qt-android-runtime" = qtAndroidRoot;
         "qt-android-runtime-full" = qtAndroidRootFull;
         "android-run" = voxoraAndroidRun;
@@ -394,6 +625,8 @@
         "desktop-build" = app "${voxoraDesktopBuild}/bin/voxora-desktop-build" "Build the desktop binary into dist/";
         "android-build" = app "${voxoraAndroidBuild}/bin/voxora-android-build" "Build the Android APK";
         "android-keystore-setup" = app "${voxoraAndroidKeystoreSetup}/bin/voxora-android-keystore-setup" "Create Android signing keystore and env file";
+        "android-ffmpeg-build" = app "${voxoraAndroidFfmpegBuild}/bin/voxora-android-ffmpeg-build" "Build Android ffmpeg via bookzhan/ffmpeg-android-build";
+        "android-ffmpeg-stage" = app "${voxoraAndroidFfmpegStage}/bin/voxora-android-ffmpeg-stage" "Stage built ffmpeg artifacts into third_party/ffmpeg/android/<abi>/ffmpeg";
         "android-run" = app "${voxoraAndroidRun}/bin/voxora-android-run" "Install if needed and launch the Android app over adb";
         "miqt-rcc" = app "${miqtRcc}/bin/miqt-rcc" "Generate MIQT Qt resource wrappers";
       };
@@ -414,7 +647,7 @@
           ${commonEnv}
           ${androidSdkEnv}
 
-          printf '%s\n' "Available commands: nix run .#run, nix run .#desktop-build, nix run .#android-build, nix run .#android-keystore-setup, nix run .#android-run, nix run .#miqt-rcc"
+          printf '%s\n' "Available commands: nix run .#run, nix run .#desktop-build, nix run .#android-build, nix run .#android-keystore-setup, nix run .#android-ffmpeg-build, nix run .#android-ffmpeg-stage, nix run .#android-run, nix run .#miqt-rcc"
         '';
       };
     };
