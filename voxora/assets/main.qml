@@ -28,9 +28,7 @@ Window {
     property int pendingSeekTargetMs: -1
     property real pendingSeekRatio: -1
     property int pendingResumeAttempts: 0
-    property bool restoreTrackListScrollPending: false
-    property real restoreTrackListScrollY: 0
-    property int restoreTrackListScrollAttempts: 0
+    property int loadMoreRequestedForCount: -1
     property real userVolume: 0.8
     property var navigationStack: []
     property real playbackProgress: effectiveDurationMs > 0 ? Math.max(0, Math.min(1, localPlayer.position / effectiveDurationMs)) : 0
@@ -317,15 +315,17 @@ Window {
         return contentLoader.item.trackListViewRef
     }
 
-    function requestLoadMoreTracksPreserveScroll() {
+    function requestLoadMoreTracksPreserveScroll(forceRequest) {
+        var force = !!forceRequest
         if (spotifyAuthBridge.isLoadingTracks || !spotifyAuthBridge.trackHasMore) {
             return
         }
-        var lv = activeTrackListView()
-        if (lv) {
-            restoreTrackListScrollY = lv.contentY
-            restoreTrackListScrollPending = true
-            restoreTrackListScrollAttempts = 0
+        var currentCount = trackListModel.count
+        if (!force && currentCount === loadMoreRequestedForCount) {
+            return
+        }
+        if (!force) {
+            loadMoreRequestedForCount = currentCount
         }
         spotifyAuthBridge.loadMoreTracksNonce = Date.now()
     }
@@ -460,30 +460,6 @@ Window {
     }
 
     Timer {
-        id: restoreTrackListScrollTimer
-        interval: 16
-        repeat: true
-        running: false
-        onTriggered: {
-            var lv = activeTrackListView()
-            if (!restoreTrackListScrollPending || !lv) {
-                stop()
-                return
-            }
-
-            var maxY = Math.max(0, lv.contentHeight - lv.height)
-            var targetY = Math.max(0, Math.min(restoreTrackListScrollY, maxY))
-            lv.contentY = targetY
-            restoreTrackListScrollAttempts += 1
-
-            if (Math.abs(lv.contentY - targetY) <= 1 || restoreTrackListScrollAttempts > 12) {
-                restoreTrackListScrollPending = false
-                stop()
-            }
-        }
-    }
-
-    Timer {
         id: recoverStreamingTimer
         interval: 180
         repeat: false
@@ -549,9 +525,68 @@ Window {
         }
     }
 
+    ListModel {
+        id: trackListModel
+    }
+
+    function normalizeTrackItem(item) {
+        return {
+            Name: item && item.Name ? item.Name : "",
+            URI: item && item.URI ? item.URI : "",
+            ArtistText: item && item.ArtistText ? item.ArtistText : "",
+            DownloadedPath: item && item.DownloadedPath ? item.DownloadedPath : "",
+            DurationMs: item && item.DurationMs ? Number(item.DurationMs) : 0
+        }
+    }
+
+    function syncTrackListModel(items) {
+        var incoming = Array.isArray(items) ? items : []
+        var existingCount = trackListModel.count
+
+        if (incoming.length === 0) {
+            if (existingCount > 0) {
+                trackListModel.clear()
+            }
+            return
+        }
+
+        var canIncremental = existingCount > 0 && incoming.length >= existingCount
+        if (canIncremental) {
+            for (var i = 0; i < existingCount; i += 1) {
+                var existingItem = trackListModel.get(i)
+                var nextItem = normalizeTrackItem(incoming[i])
+                if ((existingItem.URI || "") !== (nextItem.URI || "") || (existingItem.Name || "") !== (nextItem.Name || "")) {
+                    canIncremental = false
+                    break
+                }
+            }
+        }
+
+        if (!canIncremental) {
+            trackListModel.clear()
+            for (var j = 0; j < incoming.length; j += 1) {
+                trackListModel.append(normalizeTrackItem(incoming[j]))
+            }
+            return
+        }
+
+        for (var k = 0; k < existingCount; k += 1) {
+            trackListModel.set(k, normalizeTrackItem(incoming[k]))
+        }
+        for (var n = existingCount; n < incoming.length; n += 1) {
+            trackListModel.append(normalizeTrackItem(incoming[n]))
+        }
+    }
+
     onTrackListDataChanged: {
-        if (restoreTrackListScrollPending) {
-            restoreTrackListScrollTimer.restart()
+        syncTrackListModel(trackListData)
+        if (trackListData.length === 0) {
+            loadMoreRequestedForCount = -1
+            var lv = activeTrackListView()
+            if (lv) {
+                lv.autoLoadIssuedForCount = -1
+                lv.autoLoadAwaitUserScroll = false
+            }
         }
     }
 
@@ -811,26 +846,35 @@ Window {
                 width: parent.width
                 height: parent.height - 200
                 clip: true
-                model: trackListData
+                reuseItems: true
+                cacheBuffer: 0
+                displayMarginBeginning: 0
+                displayMarginEnd: 0
+                model: trackListModel
                 property int autoLoadIssuedForCount: -1
+                property bool autoLoadAwaitUserScroll: false
 
                 function requestMoreIfNeeded() {
-                    var currentCount = trackListData.length
+                    var currentCount = trackListModel.count
                     if (currentCount <= 0) {
                         autoLoadIssuedForCount = -1
+                        autoLoadAwaitUserScroll = false
                         return
                     }
                     var prefetchRows = 10
                     var estimatedRowHeight = 52
                     var prefetchDistance = prefetchRows * estimatedRowHeight
                     var nearEnd = (contentY + height) >= (contentHeight - prefetchDistance)
-                    if (currentCount !== autoLoadIssuedForCount && !spotifyAuthBridge.isLoadingTracks && spotifyAuthBridge.trackHasMore && nearEnd) {
+                    if (!autoLoadAwaitUserScroll && currentCount !== autoLoadIssuedForCount && !spotifyAuthBridge.isLoadingTracks && spotifyAuthBridge.trackHasMore && nearEnd) {
                         autoLoadIssuedForCount = currentCount
-                        requestLoadMoreTracksPreserveScroll()
+                        autoLoadAwaitUserScroll = true
+                        requestLoadMoreTracksPreserveScroll(false)
                     }
                 }
 
-                onContentYChanged: requestMoreIfNeeded()
+                onMovementStarted: {
+                    autoLoadAwaitUserScroll = false
+                }
 
                 onMovementEnded: requestMoreIfNeeded()
 
@@ -853,15 +897,15 @@ Window {
                                 spacing: 6
 
                                 Text {
-                                    text: modelData.Name || modelData.URI || "Unknown track"
+                                    text: Name || URI || "Unknown track"
                                     color: "#f0f5ff"
                                     elide: Text.ElideRight
-                                    width: modelData.DownloadedPath ? Math.max(80, parent.width - downloadedBadge.width - 8) : parent.width
+                                    width: DownloadedPath ? Math.max(80, parent.width - downloadedBadge.width - 8) : parent.width
                                 }
 
                                 Rectangle {
                                     id: downloadedBadge
-                                    visible: !!modelData.DownloadedPath
+                                    visible: !!DownloadedPath
                                     radius: 4
                                     color: "#1f7a3a"
                                     border.color: "#36a85a"
@@ -880,7 +924,7 @@ Window {
                             }
 
                             Text {
-                                text: modelData.ArtistText || modelData.URI || ""
+                                text: ArtistText || URI || ""
                                 color: "#8ea4c2"
                                 elide: Text.ElideRight
                                 width: parent.width
@@ -890,12 +934,12 @@ Window {
                         Button {
                             text: spotifyAuthBridge.isDownloadingTrack ? "Downloading..." : "Download"
                             enabled: !spotifyAuthBridge.isDownloadingTrack
-                            onClicked: spotifyAuthBridge.downloadTrackRequest = (modelData.URI || "") + "\n" + (modelData.Name || "Track") + "\n" + Date.now()
+                            onClicked: spotifyAuthBridge.downloadTrackRequest = (URI || "") + "\n" + (Name || "Track") + "\n" + Date.now()
                         }
 
                         Button {
                             text: "Play"
-                            enabled: modelData.DownloadedPath ? true : !spotifyAuthBridge.isStreamingTrack
+                            enabled: DownloadedPath ? true : !spotifyAuthBridge.isStreamingTrack
                             onClicked: {
                                 manualStopRequested = true
                                 streamRecovering = false
@@ -909,14 +953,14 @@ Window {
                                 localPlayer.stop()
                                 spotifyAuthBridge.clearStreamNonce = Date.now()
                                 manualStopRequested = false
-                                if (modelData.DownloadedPath) {
-                                    expectedDurationMs = modelData.DurationMs || 0
-                                    currentPlayingPath = modelData.DownloadedPath || ""
+                                if (DownloadedPath) {
+                                    expectedDurationMs = DurationMs || 0
+                                    currentPlayingPath = DownloadedPath || ""
                                     localPlayer.source = toFileUrl(currentPlayingPath)
                                     localPlayer.play()
                                 } else {
-                                    expectedDurationMs = modelData.DurationMs || 0
-                                    spotifyAuthBridge.streamTrackRequest = (modelData.URI || "") + "\n" + (modelData.Name || "Track") + "\n" + Date.now()
+                                    expectedDurationMs = DurationMs || 0
+                                    spotifyAuthBridge.streamTrackRequest = (URI || "") + "\n" + (Name || "Track") + "\n" + Date.now()
                                 }
                             }
                         }
@@ -952,13 +996,13 @@ Window {
                         text: spotifyAuthBridge.isLoadingTracks ? "Loading..." : "Load More"
                         enabled: !spotifyAuthBridge.isLoadingTracks && spotifyAuthBridge.trackHasMore
                         visible: spotifyAuthBridge.trackHasMore || spotifyAuthBridge.isLoadingTracks
-                        onClicked: requestLoadMoreTracksPreserveScroll()
+                        onClicked: requestLoadMoreTracksPreserveScroll(true)
                     }
 
                     Text {
                         text: spotifyAuthBridge.trackTotal > 0
-                              ? (trackListData.length + " / " + spotifyAuthBridge.trackTotal)
-                              : (trackListData.length + " tracks")
+                              ? (trackListModel.count + " / " + spotifyAuthBridge.trackTotal)
+                              : (trackListModel.count + " tracks")
                         color: "#8ea4c2"
                         verticalAlignment: Text.AlignVCenter
                     }
