@@ -92,6 +92,8 @@ func NewSpotifyBridge() *SpotifyBridge {
 	b.set("isStreamingTrack", false)
 	b.set("streamTrackRequest", "")
 	b.set("prebufferTrackRequest", "")
+	b.set("prebufferTracksRequest", "")
+	b.set("clearPrebufferNonce", 0)
 	b.set("streamPlayPath", "")
 	b.set("streamPlayReadyNonce", 0)
 	b.set("streamCacheReady", false)
@@ -120,6 +122,10 @@ func NewSpotifyBridge() *SpotifyBridge {
 			go b.streamTrack(value.ToString())
 		case "prebufferTrackRequest":
 			go b.prebufferTrack(value.ToString())
+		case "prebufferTracksRequest":
+			go b.prebufferTracks(value.ToString())
+		case "clearPrebufferNonce":
+			b.clearPrebuffer()
 		case "clearStreamNonce":
 			go b.clearStreamCache()
 		case "clearStreamCacheAllNonce":
@@ -1018,6 +1024,7 @@ func (b *SpotifyBridge) clearStreamCache() {
 
 func (b *SpotifyBridge) clearAllStreamCache() {
 	b.clearStreamCache()
+	b.clearPrebuffer()
 
 	cacheDir := strings.TrimSpace(streamCacheDir())
 	if cacheDir == "" {
@@ -1046,19 +1053,36 @@ func (b *SpotifyBridge) clearAllStreamCache() {
 }
 
 func (b *SpotifyBridge) prebufferTrack(raw string) {
-	parts := strings.SplitN(raw, "\n", 3)
-	if len(parts) < 1 {
-		return
-	}
+	b.prebufferTracks(raw)
+}
 
-	trackURI := strings.TrimSpace(parts[0])
-	if !strings.HasPrefix(trackURI, "spotify:track:") {
-		return
+func (b *SpotifyBridge) clearPrebuffer() {
+	b.mu.Lock()
+	if b.prebufferCancel != nil {
+		b.prebufferCancel()
+		b.prebufferCancel = nil
 	}
+	b.prebufferTrackURI = ""
+	b.prebufferOpID++
+	b.mu.Unlock()
+}
 
-	outputPath := streamCachePathForURI(trackURI)
-	if isUsableCachedStream(outputPath) {
-		_ = os.Chtimes(outputPath, time.Now(), time.Now())
+func (b *SpotifyBridge) prebufferTracks(raw string) {
+	parts := strings.Split(raw, "\n")
+	uris := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+	for _, part := range parts {
+		trackURI := strings.TrimSpace(part)
+		if !strings.HasPrefix(trackURI, "spotify:track:") {
+			continue
+		}
+		if _, ok := seen[trackURI]; ok {
+			continue
+		}
+		seen[trackURI] = struct{}{}
+		uris = append(uris, trackURI)
+	}
+	if len(uris) == 0 {
 		return
 	}
 
@@ -1069,22 +1093,19 @@ func (b *SpotifyBridge) prebufferTrack(raw string) {
 	b.pruneStreamCacheIfLowDisk(cacheDir)
 
 	b.mu.Lock()
-	if b.prebufferTrackURI == trackURI && b.prebufferCancel != nil {
-		b.mu.Unlock()
-		return
-	}
 	if b.prebufferCancel != nil {
 		b.prebufferCancel()
 		b.prebufferCancel = nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	b.prebufferCancel = cancel
-	b.prebufferTrackURI = trackURI
+	b.prebufferTrackURI = uris[0]
 	b.prebufferOpID++
 	opID := b.prebufferOpID
 	b.mu.Unlock()
 
 	defer func() {
+		cancel()
 		b.mu.Lock()
 		if b.prebufferOpID == opID {
 			b.prebufferCancel = nil
@@ -1102,12 +1123,32 @@ func (b *SpotifyBridge) prebufferTrack(raw string) {
 		FFmpegPath: ffmpegPath,
 	})
 	if err != nil {
-		cancel()
 		return
 	}
 	defer func() {
 		_ = loader.Close()
 	}()
+
+	for _, trackURI := range uris {
+		if ctx.Err() != nil {
+			return
+		}
+		b.mu.Lock()
+		isCurrent := b.prebufferOpID == opID
+		b.mu.Unlock()
+		if !isCurrent {
+			return
+		}
+		b.prebufferSingleTrack(ctx, loader, trackURI)
+	}
+}
+
+func (b *SpotifyBridge) prebufferSingleTrack(ctx context.Context, loader *libspotdl.Downloader, trackURI string) {
+	outputPath := streamCachePathForURI(trackURI)
+	if isUsableCachedStream(outputPath) {
+		_ = os.Chtimes(outputPath, time.Now(), time.Now())
+		return
+	}
 
 	tmpPath := outputPath + ".prefetch.part"
 	_ = os.Remove(tmpPath)
@@ -1115,7 +1156,6 @@ func (b *SpotifyBridge) prebufferTrack(raw string) {
 
 	f, err := os.Create(tmpPath)
 	if err != nil {
-		cancel()
 		return
 	}
 	defer func() {
@@ -1123,7 +1163,6 @@ func (b *SpotifyBridge) prebufferTrack(raw string) {
 	}()
 
 	_, _, err = loader.StreamTrack(ctx, trackURI, []io.Writer{f}, nil)
-	cancel()
 	if err != nil {
 		_ = os.Remove(tmpPath)
 		return
@@ -1134,14 +1173,6 @@ func (b *SpotifyBridge) prebufferTrack(raw string) {
 		return
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return
-	}
-
-	b.mu.Lock()
-	isCurrent := b.prebufferOpID == opID
-	b.mu.Unlock()
-	if !isCurrent {
 		_ = os.Remove(tmpPath)
 		return
 	}

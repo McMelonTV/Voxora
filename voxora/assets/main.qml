@@ -42,6 +42,8 @@ Window {
     property string currentTrackDownloadedPath: ""
     property int currentTrackIndex: -1
     property bool autoplayEnabled: true
+    property bool dataSavingMode: false
+    property int prebufferAheadCount: 3
     property bool streamShouldAutoPlay: true
     property bool holdStoppedTrackState: false
     property string activeContextURI: ""
@@ -111,6 +113,7 @@ Window {
         property string trackArtist: ""
         property string albumArtURL: ""
         property int positionMs: 0
+        property bool dataSavingMode: false
     }
 
     Shortcut {
@@ -370,26 +373,35 @@ Window {
     }
 
     function requestNextTrackPrebuffer() {
-        if (!autoplayEnabled || trackListModel.count <= 0 || currentTrackIndex < 0) {
+        if (dataSavingMode || !autoplayEnabled || trackListModel.count <= 0 || currentTrackIndex < 0) {
             return
         }
-        var nextIndex = currentTrackIndex + 1
-        if (nextIndex < 0 || nextIndex >= trackListModel.count) {
+        var req = []
+        var maxAhead = Math.max(0, prebufferAheadCount)
+        for (var step = 1; step <= maxAhead; step += 1) {
+            var nextIndex = currentTrackIndex + step
+            if (nextIndex < 0 || nextIndex >= trackListModel.count) {
+                break
+            }
+            var nextItem = trackListModel.get(nextIndex)
+            if (!nextItem) {
+                continue
+            }
+            var downloadedPath = nextItem.DownloadedPath || ""
+            if (downloadedPath.length > 0) {
+                continue
+            }
+            var nextURI = nextItem.URI || ""
+            if (nextURI.length === 0) {
+                continue
+            }
+            req.push(nextURI)
+        }
+        if (req.length === 0) {
             return
         }
-        var nextItem = trackListModel.get(nextIndex)
-        if (!nextItem) {
-            return
-        }
-        var downloadedPath = nextItem.DownloadedPath || ""
-        if (downloadedPath.length > 0) {
-            return
-        }
-        var nextURI = nextItem.URI || ""
-        if (nextURI.length === 0) {
-            return
-        }
-        spotifyAuthBridge.prebufferTrackRequest = nextURI + "\n" + (nextItem.Name || "Track") + "\n" + Date.now()
+        req.push("#nonce:" + Date.now())
+        spotifyAuthBridge.prebufferTracksRequest = req.join("\n")
     }
 
     function playTrackAtIndex(index) {
@@ -442,6 +454,7 @@ Window {
     }
 
     function restoreSessionState() {
+        dataSavingMode = !!sessionState.dataSavingMode
         var contextURI = (sessionState.contextURI || "").trim()
         var trackURI = (sessionState.trackURI || "").trim()
         if (contextURI.length === 0 || trackURI.length === 0) {
@@ -910,6 +923,29 @@ Window {
                         Button {
                             text: "Clear Stream Cache"
                             onClicked: spotifyAuthBridge.clearStreamCacheAllNonce = Date.now()
+                        }
+                    }
+
+                    Row {
+                        spacing: 10
+
+                        Text {
+                            text: "Data Saving"
+                            color: "#8ea4c2"
+                            verticalAlignment: Text.AlignVCenter
+                        }
+
+                        Button {
+                            text: dataSavingMode ? "On" : "Off"
+                            onClicked: {
+                                dataSavingMode = !dataSavingMode
+                                sessionState.dataSavingMode = dataSavingMode
+                                if (dataSavingMode) {
+                                    spotifyAuthBridge.clearPrebufferNonce = Date.now()
+                                } else {
+                                    requestNextTrackPrebuffer()
+                                }
+                            }
                         }
                     }
                 }

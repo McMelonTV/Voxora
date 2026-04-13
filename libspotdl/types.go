@@ -186,6 +186,7 @@ type LibraryTrackSummary struct {
 	URI            string
 	Name           string
 	ArtistText     string
+	AlbumArtURL    string
 	DurationMs     int64
 	Downloaded     bool
 	DownloadedPath string

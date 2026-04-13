@@ -281,6 +281,10 @@ func resolveTrackSummariesBatch(ctx context.Context, sess *librespotsession.Sess
 				}
 			}
 			summary.ArtistText = strings.Join(artists, ", ")
+			summary.AlbumArtURL = artworkURLFromImages(meta.GetAlbum().GetCover())
+			if summary.AlbumArtURL == "" {
+				summary.AlbumArtURL = artworkURLFromImages(meta.GetAlbum().GetCoverGroup().GetImage())
+			}
 			summary.DurationMs = int64(meta.GetDuration())
 			summaries[uri] = summary
 		}
