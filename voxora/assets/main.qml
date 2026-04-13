@@ -104,6 +104,13 @@ Window {
         return m + ":" + (s < 10 ? "0" + s : s)
     }
 
+    function isPartStreamPath(path) {
+        if (!path) {
+            return false
+        }
+        return path.endsWith(".stream.play.ogg") || path.endsWith(".stream.ogg.part")
+    }
+
     function recoverStreamingPlayback() {
         if (manualStopRequested || streamRecovering) {
             return
@@ -151,7 +158,7 @@ Window {
             return
         }
         var targetPath = currentPlayingPath || ""
-        if (!targetPath.endsWith(".stream.ogg.part")) {
+        if (!isPartStreamPath(targetPath)) {
             return
         }
         var nowMs = Date.now()
@@ -187,7 +194,7 @@ Window {
 
         var cachePath = spotifyAuthBridge.streamCachePath || ""
         var isLiveFifo = currentPlayingPath.endsWith(".live.fifo")
-        var isPartStream = currentPlayingPath.endsWith(".stream.ogg.part")
+        var isPartStream = isPartStreamPath(currentPlayingPath)
 
         if (!seekEnabledForCurrentSource) {
             if ((isLiveFifo || isPartStream) && spotifyAuthBridge.streamCacheReady && cachePath.length > 0) {
@@ -332,7 +339,7 @@ Window {
             applyPendingResume()
         }
         onPositionChanged: {
-            if (!streamSourceSwitching && !scrubbingActive && currentPlayingPath.endsWith(".stream.ogg.part")) {
+            if (!streamSourceSwitching && !scrubbingActive && isPartStreamPath(currentPlayingPath)) {
                 var total = Number(spotifyAuthBridge.streamBufferedTotal)
                 var have = Number(spotifyAuthBridge.streamBufferedBytes)
                 if (!!spotifyAuthBridge.isStreamingTrack && !isNaN(total) && !isNaN(have) && total > 0 && effectiveDurationMs > 0) {

@@ -576,9 +576,18 @@ func streamCacheDir() string {
 }
 
 const (
-	streamCacheReadyBytes = int64(32 * 1024)
-	streamCacheMinFree    = uint64(1024 * 1024 * 1024) // 1 GiB
+	streamCacheReadyBytes          = int64(32 * 1024)
+	streamPlaybackReadyBytes       = int64(512 * 1024)
+	streamPlaybackReadyBytesAndroid = int64(2 * 1024 * 1024)
+	streamCacheMinFree             = uint64(1024 * 1024 * 1024) // 1 GiB
 )
+
+func streamPlaybackReadyThreshold() int64 {
+	if runtime.GOOS == "android" {
+		return streamPlaybackReadyBytesAndroid
+	}
+	return streamPlaybackReadyBytes
+}
 
 type cachedStreamFile struct {
 	path    string
@@ -591,7 +600,7 @@ func streamCachePathForURI(uri string) string {
 }
 
 func streamPartPathForURI(uri string) string {
-	return filepath.Join(streamCacheDir(), sanitizeTrackID(uri)+".stream.ogg.part")
+	return filepath.Join(streamCacheDir(), sanitizeTrackID(uri)+".stream.play.ogg")
 }
 
 func streamCacheDoneMarkerPathForStream(path string) string {
@@ -740,7 +749,7 @@ func (b *SpotifyBridge) clearAllStreamCache() {
 			return nil
 		}
 		name := strings.ToLower(d.Name())
-		if strings.HasSuffix(name, ".stream.ogg") || strings.HasSuffix(name, ".stream.ogg.part") || strings.HasSuffix(name, ".stream.ogg.done") || strings.HasSuffix(name, ".live.fifo") {
+		if strings.HasSuffix(name, ".stream.ogg") || strings.HasSuffix(name, ".stream.play.ogg") || strings.HasSuffix(name, ".stream.ogg.part") || strings.HasSuffix(name, ".stream.ogg.done") || strings.HasSuffix(name, ".live.fifo") {
 			if remErr := os.Remove(path); remErr == nil {
 				removed++
 			}
@@ -1053,6 +1062,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	defer b.transferMu.Unlock()
 
 	readySignaled := false
+	readyThreshold := streamPlaybackReadyThreshold()
 	_, _, err = downloader.StreamTrack(ctx, trackURI, []io.Writer{streamWriter}, func(p libspotdl.Progress) {
 		b.mu.Lock()
 		isCurrent := b.streamOpID == opID
@@ -1074,7 +1084,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 			}
 		}
 
-		if !readySignaled && p.Stage == "downloading" && p.BytesWritten >= streamCacheReadyBytes {
+		if !readySignaled && p.Stage == "downloading" && p.BytesWritten >= readyThreshold {
 			readySignaled = true
 			if !useFIFO {
 				b.mu.Lock()
