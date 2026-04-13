@@ -33,6 +33,18 @@ Window {
     property real userVolume: 0.8
     property real playbackProgress: effectiveDurationMs > 0 ? Math.max(0, Math.min(1, localPlayer.position / effectiveDurationMs)) : 0
     property bool usingStreamSource: currentPlayingPath.length > 0 && currentPlayingPath === (spotifyAuthBridge.streamPlayPath || "")
+    property bool streamFullyBuffered: {
+        if (!usingStreamSource) {
+            return true
+        }
+        var total = Number(spotifyAuthBridge.streamBufferedTotal)
+        var have = Number(spotifyAuthBridge.streamBufferedBytes)
+        if (!isNaN(total) && !isNaN(have) && total > 0) {
+            return have >= Math.max(0, total - 32768)
+        }
+        return !spotifyAuthBridge.isStreamingTrack
+    }
+    property bool seekEnabledForCurrentSource: !usingStreamSource || streamFullyBuffered
     property real bufferedProgressLatched: 0
     property real streamFetchProgress: {
         var total = Number(spotifyAuthBridge.streamBufferedTotal)
@@ -108,6 +120,8 @@ Window {
         var currentSource = localPlayer.source ? localPlayer.source.toString() : ""
         var targetSource = toFileUrl(targetPath)
         var isLiveFifo = targetPath.endsWith(".live.fifo")
+        var cachePath = spotifyAuthBridge.streamCachePath || ""
+        var usingCachePath = cachePath.length > 0 && targetPath === cachePath
         if (currentSource.length === 0 && targetSource.length > 0) {
             localPlayer.source = targetSource
         }
@@ -117,6 +131,15 @@ Window {
             pendingSeekRatio = -1
             pendingSeekTargetMs = -1
             pendingResumeAttempts = 0
+
+            // When Android MediaPlayer stops after hitting a temporary EOF on a growing file,
+            // force a source reload so it re-reads updated file length and can continue.
+            if (usingCachePath && targetSource.length > 0) {
+                streamSourceSwitching = true
+                streamSourceSwitchShouldPlay = true
+                localPlayer.source = ""
+                localPlayer.source = targetSource
+            }
         }
         recoverStreamingTimer.restart()
     }
@@ -134,11 +157,32 @@ Window {
         if (effectiveDurationMs <= 0) {
             return
         }
+
+        var cachePath = spotifyAuthBridge.streamCachePath || ""
+        var isLiveFifo = currentPlayingPath.endsWith(".live.fifo")
+        var isPartStream = currentPlayingPath.endsWith(".stream.ogg.part")
+
+        if (!seekEnabledForCurrentSource) {
+            if ((isLiveFifo || isPartStream) && spotifyAuthBridge.streamCacheReady && cachePath.length > 0) {
+                streamSourceSwitching = true
+                streamSourceSwitchShouldPlay = localPlayer.playbackState === MediaPlayer.PlayingState
+                pendingSeekRatio = Math.max(0, Math.min(1, ratio))
+                pendingResumePositionMs = Math.floor(effectiveDurationMs * pendingSeekRatio)
+                pendingResumeAttempts = 0
+                currentPlayingPath = cachePath
+                localPlayer.source = ""
+                localPlayer.source = toFileUrl(cachePath)
+                return
+            }
+            spotifyAuthBridge.trackListStatus = "Seek is available after stream buffering finishes"
+            return
+        }
+
         ratio = Math.max(0, Math.min(1, ratio))
         var targetPos = Math.floor(effectiveDurationMs * ratio)
 
-        if (currentPlayingPath.endsWith(".live.fifo")) {
-            var cachedPath = spotifyAuthBridge.streamCachePath || ""
+        if (isLiveFifo || isPartStream) {
+            var cachedPath = cachePath
             var have = Number(spotifyAuthBridge.streamBufferedBytes)
             var total = Number(spotifyAuthBridge.streamBufferedTotal)
             var canSeekInCache = spotifyAuthBridge.streamCacheReady && cachedPath.length > 0
@@ -161,10 +205,11 @@ Window {
         }
 
         localPlayer.position = targetPos
-        pendingSeekRatio = ratio
-        pendingResumePositionMs = targetPos
+        pendingResumePositionMs = -1
+        pendingSeekTargetMs = -1
+        pendingSeekRatio = -1
         pendingResumeAttempts = 0
-        resumeSeekTimer.restart()
+        resumeSeekTimer.stop()
     }
 
     function togglePlayPause() {
@@ -213,7 +258,7 @@ Window {
         var maxPos = baseDuration > 1000 ? (baseDuration - 250) : target
         target = Math.max(0, Math.min(target, maxPos))
 
-        var readyForSeek = localPlayer.seekable || (localPlayer.duration > 0 && !currentPlayingPath.endsWith(".live.fifo"))
+        var readyForSeek = seekEnabledForCurrentSource && (localPlayer.seekable || (localPlayer.duration > 0 && !currentPlayingPath.endsWith(".live.fifo")))
         if (readyForSeek) {
             localPlayer.position = target
             pendingSeekTargetMs = target
@@ -291,7 +336,8 @@ Window {
                 )
                 var hasNewBufferedData = bufferedNow > (streamOpenBufferedBytes + 8192)
                 var stillDownloading = !!spotifyAuthBridge.isStreamingTrack
-                var recoverableStop = !likelyNaturalEnd && (currentPlayingPath.endsWith(".live.fifo") || hasNewBufferedData || stillDownloading)
+                var isCacheStop = cachePath.length > 0 && currentPlayingPath === cachePath
+                var recoverableStop = !likelyNaturalEnd && (currentPlayingPath.endsWith(".live.fifo") || hasNewBufferedData || stillDownloading || isCacheStop)
 
                 if (!manualStopRequested && !streamRecovering && isPotentialStreamStop && recoverableStop && streamRecoverAttempts < 6) {
                     recoverStreamingPlayback()
@@ -382,6 +428,7 @@ Window {
                     resumeSeekTimer.stop()
                     streamOpenBufferedBytes = Number(spotifyAuthBridge.streamBufferedBytes) || 0
                     bufferedProgressLatched = 0
+                    localPlayer.source = ""
                     localPlayer.source = toFileUrl(nextPath)
                     localPlayer.play()
                 }
@@ -623,6 +670,10 @@ Window {
                                 anchors.fill: parent
                                 anchors.margins: -10
                                 onPressed: function(mouse) {
+                                    if (!seekEnabledForCurrentSource) {
+                                        spotifyAuthBridge.trackListStatus = "Seek is available after stream buffering finishes"
+                                        return
+                                    }
                                     scrubbingActive = true
                                     resumeAfterScrub = localPlayer.playbackState === MediaPlayer.PlayingState
                                     if (resumeAfterScrub) {

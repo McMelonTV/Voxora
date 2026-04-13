@@ -590,6 +590,18 @@ func streamCachePathForURI(uri string) string {
 	return filepath.Join(streamCacheDir(), sanitizeTrackID(uri)+".stream.ogg")
 }
 
+func streamPartPathForURI(uri string) string {
+	return filepath.Join(streamCacheDir(), sanitizeTrackID(uri)+".stream.ogg.part")
+}
+
+func streamCacheDoneMarkerPathForStream(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	return path + ".done"
+}
+
 func isUsableCachedStream(path string) bool {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -598,7 +610,17 @@ func isUsableCachedStream(path string) bool {
 	if info.IsDir() {
 		return false
 	}
-	return info.Size() >= streamCacheReadyBytes
+	if info.Size() < streamCacheReadyBytes {
+		return false
+	}
+	done := streamCacheDoneMarkerPathForStream(path)
+	if done == "" {
+		return false
+	}
+	if marker, err := os.Stat(done); err != nil || marker.IsDir() {
+		return false
+	}
+	return true
 }
 
 func freeDiskBytes(path string) uint64 {
@@ -718,7 +740,7 @@ func (b *SpotifyBridge) clearAllStreamCache() {
 			return nil
 		}
 		name := strings.ToLower(d.Name())
-		if strings.HasSuffix(name, ".stream.ogg") || strings.HasSuffix(name, ".live.fifo") {
+		if strings.HasSuffix(name, ".stream.ogg") || strings.HasSuffix(name, ".stream.ogg.part") || strings.HasSuffix(name, ".stream.ogg.done") || strings.HasSuffix(name, ".live.fifo") {
 			if remErr := os.Remove(path); remErr == nil {
 				removed++
 			}
@@ -776,6 +798,12 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	b.pruneStreamCacheIfLowDisk(cacheDir)
 
 	outputPath := streamCachePathForURI(trackURI)
+	partPath := streamPartPathForURI(trackURI)
+	activeOutputPath := outputPath
+	if runtime.GOOS == "android" {
+		activeOutputPath = partPath
+	}
+	doneMarkerPath := streamCacheDoneMarkerPathForStream(outputPath)
 	if isUsableCachedStream(outputPath) {
 		_ = os.Chtimes(outputPath, time.Now(), time.Now())
 		if info, statErr := os.Stat(outputPath); statErr == nil {
@@ -803,94 +831,131 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 		b.set("isStreamingTrack", false)
 		return
 	}
-
-	fifoPath := streamFIFOPathForURI(trackURI)
-	_ = os.Remove(fifoPath)
-	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
-		b.set("isStreamingTrack", false)
-		b.set("lastError", err.Error())
-		b.set("trackListStatus", "Stream failed")
-		return
+	if doneMarkerPath != "" {
+		_ = os.Remove(doneMarkerPath)
+	}
+ 	if activeOutputPath != outputPath {
+		_ = os.Remove(activeOutputPath)
 	}
 
-	b.mu.Lock()
-	b.activeStreamFIFO = fifoPath
-	if b.streamOpID == opID {
-		b.streamReadyNonce++
-		nonce := b.streamReadyNonce
-		b.mu.Unlock()
-		b.set("streamPlayPath", fifoPath)
-		b.set("streamPlayReadyNonce", nonce)
+	useFIFO := runtime.GOOS != "android"
+	fifoPath := ""
+	if useFIFO {
+		fifoPath = streamFIFOPathForURI(trackURI)
+		_ = os.Remove(fifoPath)
+		if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+			b.set("isStreamingTrack", false)
+			b.set("lastError", err.Error())
+			b.set("trackListStatus", "Stream failed")
+			return
+		}
+
+		b.mu.Lock()
+		b.activeStreamFIFO = fifoPath
+		if b.streamOpID == opID {
+			b.streamReadyNonce++
+			nonce := b.streamReadyNonce
+			b.mu.Unlock()
+			b.set("streamPlayPath", fifoPath)
+			b.set("streamPlayReadyNonce", nonce)
+		} else {
+			b.mu.Unlock()
+			_ = os.Remove(fifoPath)
+			b.set("isStreamingTrack", false)
+			return
+		}
 	} else {
+		b.mu.Lock()
+		if b.streamOpID != opID {
+			b.mu.Unlock()
+			b.set("isStreamingTrack", false)
+			return
+		}
 		b.mu.Unlock()
-		_ = os.Remove(fifoPath)
-		b.set("isStreamingTrack", false)
-		return
 	}
 
-	cacheFile, err := os.Create(outputPath)
+	cacheFile, err := os.Create(activeOutputPath)
 	if err != nil {
-		_ = os.Remove(fifoPath)
+		if useFIFO {
+			_ = os.Remove(fifoPath)
+		}
 		b.set("isStreamingTrack", false)
 		b.set("lastError", err.Error())
 		b.set("trackListStatus", "Stream failed")
 		return
 	}
-	defer cacheFile.Close()
+	cacheFileClosed := false
+	closeCacheFile := func() {
+		if cacheFileClosed {
+			return
+		}
+		_ = cacheFile.Sync()
+		_ = cacheFile.Close()
+		cacheFileClosed = true
+	}
+	defer closeCacheFile()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 
 	b.mu.Lock()
 	b.streamCancel = cancel
-	b.currentStream = outputPath
+	b.currentStream = activeOutputPath
 	b.mu.Unlock()
 
 	downloadDone := make(chan struct{})
 	tailDone := make(chan struct{})
-	go func() {
-		defer close(tailDone)
+	if useFIFO {
+		go func() {
+			defer close(tailDone)
 
-		fifoWriter, ferr := os.OpenFile(fifoPath, os.O_WRONLY, 0)
-		if ferr != nil {
-			return
-		}
-		defer func() {
-			_ = fifoWriter.Close()
+			fifoWriter, ferr := os.OpenFile(fifoPath, os.O_WRONLY, 0)
+			if ferr != nil {
+				return
+			}
+			defer func() {
+				_ = fifoWriter.Close()
+				b.mu.Lock()
+				if b.activeStreamWrite == fifoWriter {
+					b.activeStreamWrite = nil
+				}
+				b.mu.Unlock()
+			}()
+
 			b.mu.Lock()
-			if b.activeStreamWrite == fifoWriter {
-				b.activeStreamWrite = nil
+			if b.streamOpID == opID {
+				b.activeStreamWrite = fifoWriter
 			}
 			b.mu.Unlock()
-		}()
 
-		b.mu.Lock()
-		if b.streamOpID == opID {
-			b.activeStreamWrite = fifoWriter
-		}
-		b.mu.Unlock()
-
-		cacheReader, rerr := os.Open(outputPath)
-		if rerr != nil {
-			return
-		}
-		defer cacheReader.Close()
-
-		buf := make([]byte, 64*1024)
-		downloadFinished := false
-		for {
-			select {
-			case <-ctx.Done():
+			cacheReader, rerr := os.Open(activeOutputPath)
+			if rerr != nil {
 				return
-			default:
 			}
+			defer cacheReader.Close()
 
-			n, readErr := cacheReader.Read(buf)
-			if n > 0 {
-				written := 0
-				for written < n {
-					wn, werr := fifoWriter.Write(buf[written:n])
-					if werr != nil {
-						if errors.Is(werr, syscall.EPIPE) {
+			buf := make([]byte, 64*1024)
+			downloadFinished := false
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				n, readErr := cacheReader.Read(buf)
+				if n > 0 {
+					written := 0
+					for written < n {
+						wn, werr := fifoWriter.Write(buf[written:n])
+						if werr != nil {
+							if errors.Is(werr, syscall.EPIPE) {
+								select {
+								case <-ctx.Done():
+									return
+								case <-time.After(15 * time.Millisecond):
+								}
+								continue
+							}
 							select {
 							case <-ctx.Done():
 								return
@@ -898,66 +963,64 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 							}
 							continue
 						}
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(15 * time.Millisecond):
+						if wn <= 0 {
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(15 * time.Millisecond):
+							}
+							continue
 						}
-						continue
+						written += wn
 					}
-					if wn <= 0 {
-						select {
-						case <-ctx.Done():
-							return
-						case <-time.After(15 * time.Millisecond):
-						}
-						continue
-					}
-					written += wn
 				}
-			}
 
-			if readErr == nil {
-				continue
-			}
-			if !errors.Is(readErr, io.EOF) {
+				if readErr == nil {
+					continue
+				}
+				if !errors.Is(readErr, io.EOF) {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(15 * time.Millisecond):
+					}
+					continue
+				}
+
+				if !downloadFinished {
+					select {
+					case <-downloadDone:
+						downloadFinished = true
+					default:
+					}
+				}
+
+				if downloadFinished {
+					pos, _ := cacheReader.Seek(0, io.SeekCurrent)
+					if info, serr := os.Stat(activeOutputPath); serr == nil && pos >= info.Size() {
+						return
+					}
+				}
+
 				select {
 				case <-ctx.Done():
 					return
 				case <-time.After(15 * time.Millisecond):
 				}
-				continue
 			}
-
-			if !downloadFinished {
-				select {
-				case <-downloadDone:
-					downloadFinished = true
-				default:
-				}
-			}
-
-			if downloadFinished {
-				pos, _ := cacheReader.Seek(0, io.SeekCurrent)
-				if info, serr := os.Stat(outputPath); serr == nil && pos >= info.Size() {
-					return
-				}
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(15 * time.Millisecond):
-			}
-		}
-	}()
+		}()
+	} else {
+		close(tailDone)
+	}
 
 	downloader, err := b.sharedDownloaderFor(ctx)
 	if err != nil {
 		cancel()
 		close(downloadDone)
 		<-tailDone
-		_ = os.Remove(fifoPath)
+		if useFIFO {
+			_ = os.Remove(fifoPath)
+		}
 		b.set("isStreamingTrack", false)
 		b.set("lastError", err.Error())
 		b.set("trackListStatus", "Stream failed")
@@ -991,6 +1054,18 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 
 		if !readySignaled && p.Stage == "downloading" && p.BytesWritten >= streamCacheReadyBytes {
 			readySignaled = true
+			if !useFIFO {
+				b.mu.Lock()
+				if b.streamOpID == opID {
+					b.streamReadyNonce++
+					nonce := b.streamReadyNonce
+					b.mu.Unlock()
+					b.set("streamPlayPath", activeOutputPath)
+					b.set("streamPlayReadyNonce", nonce)
+				} else {
+					b.mu.Unlock()
+				}
+			}
 			b.set("streamCacheReady", true)
 			b.set("streamCachePath", outputPath)
 			b.set("isStreamingTrack", false)
@@ -1000,7 +1075,9 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	close(downloadDone)
 	<-tailDone
 	cancel()
-	_ = os.Remove(fifoPath)
+	if useFIFO {
+		_ = os.Remove(fifoPath)
+	}
 	b.mu.Lock()
 	if b.activeStreamFIFO == fifoPath {
 		b.activeStreamFIFO = ""
@@ -1024,7 +1101,46 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 		return
 	}
 
+	closeCacheFile()
+	if activeOutputPath != outputPath {
+		_ = os.Remove(outputPath)
+		if renErr := os.Rename(activeOutputPath, outputPath); renErr != nil {
+			b.set("isStreamingTrack", false)
+			b.set("lastError", renErr.Error())
+			b.set("trackListStatus", "Stream failed")
+			return
+		}
+	}
+	if doneMarkerPath != "" {
+		_ = os.WriteFile(doneMarkerPath, []byte("ok\n"), 0o644)
+	}
+	if !useFIFO && activeOutputPath != outputPath {
+		b.mu.Lock()
+		if b.streamOpID == opID {
+			b.currentStream = outputPath
+			b.streamReadyNonce++
+			nonce := b.streamReadyNonce
+			b.mu.Unlock()
+			b.set("streamPlayPath", outputPath)
+			b.set("streamPlayReadyNonce", nonce)
+		} else {
+			b.mu.Unlock()
+		}
+	}
+
 	if !readySignaled {
+		if !useFIFO {
+			b.mu.Lock()
+			if b.streamOpID == opID {
+				b.streamReadyNonce++
+				nonce := b.streamReadyNonce
+				b.mu.Unlock()
+				b.set("streamPlayPath", outputPath)
+				b.set("streamPlayReadyNonce", nonce)
+			} else {
+				b.mu.Unlock()
+			}
+		}
 		b.set("streamCacheReady", true)
 		b.set("streamCachePath", outputPath)
 	}
