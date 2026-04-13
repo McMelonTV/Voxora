@@ -576,10 +576,10 @@ func streamCacheDir() string {
 }
 
 const (
-	streamCacheReadyBytes          = int64(32 * 1024)
-	streamPlaybackReadyBytes       = int64(512 * 1024)
+	streamCacheReadyBytes           = int64(32 * 1024)
+	streamPlaybackReadyBytes        = int64(512 * 1024)
 	streamPlaybackReadyBytesAndroid = int64(2 * 1024 * 1024)
-	streamCacheMinFree             = uint64(1024 * 1024 * 1024) // 1 GiB
+	streamCacheMinFree              = uint64(1024 * 1024 * 1024) // 1 GiB
 )
 
 func streamPlaybackReadyThreshold() int64 {
