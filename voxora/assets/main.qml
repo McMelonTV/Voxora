@@ -32,6 +32,7 @@ Window {
     property real restoreTrackListScrollY: 0
     property int restoreTrackListScrollAttempts: 0
     property real userVolume: 0.8
+    property var navigationStack: []
     property real playbackProgress: effectiveDurationMs > 0 ? Math.max(0, Math.min(1, localPlayer.position / effectiveDurationMs)) : 0
     property bool usingStreamSource: currentPlayingPath.length > 0 && currentPlayingPath === (spotifyAuthBridge.streamPlayPath || "")
     property bool streamFullyBuffered: {
@@ -67,6 +68,30 @@ Window {
         }
         raw = Math.max(0, Math.min(1, raw))
         return Math.max(playbackProgress, raw)
+    }
+
+    Keys.onReleased: function(event) {
+        if ((event.key === Qt.Key_Back || event.key === Qt.Key_Escape) && handleBackNavigation()) {
+            event.accepted = true
+        }
+    }
+
+    onClosing: function(close) {
+        if (handleBackNavigation()) {
+            close.accepted = false
+        }
+    }
+
+    Shortcut {
+        sequence: "Esc"
+        context: Qt.ApplicationShortcut
+        onActivated: handleBackNavigation()
+    }
+
+    Shortcut {
+        sequence: "Back"
+        context: Qt.ApplicationShortcut
+        onActivated: handleBackNavigation()
     }
 
     onStreamFetchProgressChanged: {
@@ -254,6 +279,32 @@ Window {
         } else {
             localPlayer.play()
         }
+    }
+
+    function pushNavigationEntry(entry) {
+        var next = navigationStack.slice(0)
+        next.push(entry)
+        navigationStack = next
+    }
+
+    function openCollectionFromUI(uri, name) {
+        var cleanUri = (uri || "").trim()
+        if (cleanUri.length === 0) {
+            return
+        }
+        pushNavigationEntry({ fromViewMode: spotifyAuthBridge.viewMode })
+        spotifyAuthBridge.openCollectionRequest = cleanUri + "\n" + (name || "Collection") + "\n" + Date.now()
+    }
+
+    function handleBackNavigation() {
+        if (spotifyAuthBridge.viewMode === "tracks") {
+            if (navigationStack.length > 0) {
+                navigationStack = navigationStack.slice(0, navigationStack.length - 1)
+            }
+            spotifyAuthBridge.navigateBackNonce = Date.now()
+            return true
+        }
+        return false
     }
 
     function activeTrackListView() {
@@ -548,7 +599,7 @@ Window {
                 Button {
                     text: spotifyAuthBridge.isLoadingTracks ? "Opening..." : "Open Liked Songs"
                     enabled: !spotifyAuthBridge.isLoadingTracks
-                    onClicked: spotifyAuthBridge.openCollectionRequest = "spotify:collection:tracks\n" + spotifyAuthBridge.likedSongsName + "\n" + Date.now()
+                    onClicked: openCollectionFromUI("spotify:collection:tracks", spotifyAuthBridge.likedSongsName)
                 }
             }
         }
@@ -598,7 +649,7 @@ Window {
 
                 MouseArea {
                     anchors.fill: parent
-                    onClicked: spotifyAuthBridge.openCollectionRequest = (modelData.URI || "") + "\n" + (modelData.Name || "Playlist") + "\n" + Date.now()
+                    onClicked: openCollectionFromUI(modelData.URI || "", modelData.Name || "Playlist")
                 }
             }
         }
@@ -627,7 +678,7 @@ Window {
 
                     Button {
                         text: "Back"
-                        onClicked: spotifyAuthBridge.navigateBackNonce = Date.now()
+                        onClicked: handleBackNavigation()
                     }
 
                     Text {
