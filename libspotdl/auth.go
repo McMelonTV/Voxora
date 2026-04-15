@@ -708,7 +708,7 @@ func resolveSessionCredentials(ctx context.Context, cfg Config, log librespot.Lo
 		if runtime.GOOS == "android" {
 			// Android AP token auth behaves better without an explicit username.
 			username = ""
-		} else if username == "" {
+		} else if username == "" && client != nil {
 			resolved, err := resolveSpotifyUsernameFromAccessToken(ctx, client, cfg.Auth.AccessToken)
 			if err != nil {
 				log.WithError(err).Warn("failed resolving spotify username from oauth token; proceeding without username")
@@ -720,12 +720,21 @@ func resolveSessionCredentials(ctx context.Context, cfg Config, log librespot.Lo
 			Username: username,
 			Token:    strings.TrimSpace(cfg.Auth.AccessToken),
 		}, nil
+	case !cfg.Auth.IgnoreStoredCredentials && cache != nil && cache.Username != "" && cache.StoredCredentials != "":
+		stored, err := base64.StdEncoding.DecodeString(cache.StoredCredentials)
+		if err != nil {
+			return nil, fmt.Errorf("decode cached stored credentials: %w", err)
+		}
+		return librespotsession.StoredCredentials{
+			Username: cache.Username,
+			Data:     stored,
+		}, nil
 	case !cfg.Auth.IgnoreStoredCredentials && cache != nil && strings.TrimSpace(cache.OAuthAccessToken) != "":
 		log.Debug("using cached spotify oauth access token")
 		username := strings.TrimSpace(cache.Username)
 		if runtime.GOOS == "android" {
 			username = ""
-		} else if username == "" {
+		} else if username == "" && client != nil {
 			resolved, err := resolveSpotifyUsernameFromAccessToken(ctx, client, cache.OAuthAccessToken)
 			if err != nil {
 				log.WithError(err).Warn("failed resolving spotify username from cached oauth token; proceeding without username")
@@ -736,15 +745,6 @@ func resolveSessionCredentials(ctx context.Context, cfg Config, log librespot.Lo
 		return librespotsession.SpotifyTokenCredentials{
 			Username: username,
 			Token:    strings.TrimSpace(cache.OAuthAccessToken),
-		}, nil
-	case !cfg.Auth.IgnoreStoredCredentials && cache != nil && cache.Username != "" && cache.StoredCredentials != "":
-		stored, err := base64.StdEncoding.DecodeString(cache.StoredCredentials)
-		if err != nil {
-			return nil, fmt.Errorf("decode cached stored credentials: %w", err)
-		}
-		return librespotsession.StoredCredentials{
-			Username: cache.Username,
-			Data:     stored,
 		}, nil
 	default:
 		callbackPort := cfg.Auth.CallbackPort

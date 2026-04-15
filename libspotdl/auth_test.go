@@ -55,6 +55,23 @@ func TestResolveSessionCredentialsUsesCachedStoredCredentials(t *testing.T) {
 	}
 }
 
+func TestResolveSessionCredentialsPrefersStoredCredentialsOverCachedOAuthToken(t *testing.T) {
+	cache := &credentialCache{
+		Username:          "spotify-user",
+		StoredCredentials: base64.StdEncoding.EncodeToString([]byte{1, 2, 3, 4}),
+		OAuthAccessToken:  "expired-oauth-token",
+	}
+
+	creds, err := resolveSessionCredentials(context.Background(), Config{}, newDefaultLogger(), nil, "0123456789abcdef0123456789abcdef01234567", cache)
+	if err != nil {
+		t.Fatalf("resolveSessionCredentials returned error: %v", err)
+	}
+
+	if _, ok := creds.(librespotsession.StoredCredentials); !ok {
+		t.Fatalf("resolveSessionCredentials returned %T, want StoredCredentials when both cache types exist", creds)
+	}
+}
+
 func TestResolveSessionCredentialsAllowsTokenAuthWithoutUsername(t *testing.T) {
 	creds, err := resolveSessionCredentials(context.Background(), Config{
 		Auth: AuthConfig{AccessToken: "token-without-username"},
