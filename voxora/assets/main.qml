@@ -50,6 +50,7 @@ Window {
     property bool holdStoppedTrackState: false
     property string activeContextURI: ""
     property string activeContextName: ""
+    property string activeSearchQuery: ""
     property bool restoringSession: false
     property string resumeTargetTrackURI: ""
     property int resumeTargetPositionMs: -1
@@ -110,6 +111,7 @@ Window {
         category: "playback_session"
         property string contextURI: ""
         property string contextName: ""
+        property string searchQuery: ""
         property string trackURI: ""
         property string trackName: ""
         property string trackArtist: ""
@@ -436,18 +438,32 @@ Window {
         if (cleanUri.length === 0) {
             return
         }
+        activeSearchQuery = ""
         activeContextURI = cleanUri
         activeContextName = name || "Collection"
         pushNavigationEntry({ fromViewMode: spotifyAuthBridge.viewMode })
         spotifyAuthBridge.openCollectionRequest = cleanUri + "\n" + (name || "Collection") + "\n" + Date.now()
     }
 
+    function searchTracksFromUI(query) {
+        var cleanQuery = (query || "").trim()
+        if (cleanQuery.length === 0) {
+            return
+        }
+        activeSearchQuery = cleanQuery
+        activeContextURI = ""
+        activeContextName = ""
+        pushNavigationEntry({ fromViewMode: spotifyAuthBridge.viewMode })
+        spotifyAuthBridge.searchTracksRequest = cleanQuery + "\n" + Date.now()
+    }
+
     function persistSessionState() {
-        if (activeContextURI.length === 0 || currentTrackURI.length === 0) {
+        if ((activeContextURI.length === 0 && activeSearchQuery.length === 0) || currentTrackURI.length === 0) {
             return
         }
         sessionState.contextURI = activeContextURI
         sessionState.contextName = activeContextName
+        sessionState.searchQuery = activeSearchQuery
         sessionState.trackURI = currentTrackURI
         sessionState.trackName = currentTrackTitle
         sessionState.trackArtist = currentTrackArtist
@@ -458,13 +474,15 @@ Window {
     function restoreSessionState() {
         dataSavingMode = !!sessionState.dataSavingMode
         var contextURI = (sessionState.contextURI || "").trim()
+        var searchQuery = (sessionState.searchQuery || "").trim()
         var trackURI = (sessionState.trackURI || "").trim()
-        if (contextURI.length === 0 || trackURI.length === 0) {
+        if ((contextURI.length === 0 && searchQuery.length === 0) || trackURI.length === 0) {
             return
         }
 
         activeContextURI = contextURI
-        activeContextName = (sessionState.contextName || "Collection").trim()
+        activeSearchQuery = searchQuery
+        activeContextName = contextURI.length > 0 ? (sessionState.contextName || "Collection").trim() : ""
         resumeTargetTrackURI = trackURI
         resumeTargetPositionMs = Math.max(0, Number(sessionState.positionMs) || 0)
         currentTrackURI = trackURI
@@ -473,7 +491,11 @@ Window {
         currentTrackAlbumArtUrl = sessionState.albumArtURL || ""
         restoringSession = true
 
-        spotifyAuthBridge.openCollectionRequest = activeContextURI + "\n" + (activeContextName || "Collection") + "\n" + Date.now()
+        if (activeContextURI.length > 0) {
+            spotifyAuthBridge.openCollectionRequest = activeContextURI + "\n" + (activeContextName || "Collection") + "\n" + Date.now()
+        } else {
+            spotifyAuthBridge.searchTracksRequest = activeSearchQuery + "\n" + Date.now()
+        }
     }
 
     function handleBackNavigation() {
@@ -887,6 +909,9 @@ Window {
             }
             onCollectionRequested: function(uri, name) {
                 appWindow.openCollectionFromUI(uri, name)
+            }
+            onSearchRequested: function(query) {
+                appWindow.searchTracksFromUI(query)
             }
         }
     }

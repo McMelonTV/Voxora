@@ -14,8 +14,13 @@ Column {
     signal volumeChangedByUser(real value)
     signal dataSavingToggleRequested()
     signal collectionRequested(string uri, string name)
+    signal searchRequested(string query)
 
     spacing: 0
+
+    function trimmedSearchQuery() {
+        return searchField.text ? searchField.text.trim() : ""
+    }
 
     Rectangle {
         width: parent.width
@@ -44,6 +49,30 @@ Column {
                     color: "#9ad0ff"
                     wrapMode: Text.WrapAnywhere
                     width: Math.max(120, controlsColumn.width - 170)
+                }
+            }
+
+            Row {
+                spacing: 8
+
+                TextField {
+                    id: searchField
+                    width: Math.max(180, controlsColumn.width - searchButton.width - 18)
+                    placeholderText: "Search songs on Spotify"
+                    enabled: !(root.bridge && root.bridge.isBusy)
+                    onAccepted: {
+                        var query = root.trimmedSearchQuery()
+                        if (query.length > 0) {
+                            root.searchRequested(query)
+                        }
+                    }
+                }
+
+                Button {
+                    id: searchButton
+                    text: "Search"
+                    enabled: !(root.bridge && root.bridge.isBusy) && root.trimmedSearchQuery().length > 0
+                    onClicked: root.searchRequested(root.trimmedSearchQuery())
                 }
             }
 
