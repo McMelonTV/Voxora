@@ -1,5 +1,12 @@
 <RCC>
     <qresource prefix="/">
+        <file>assets/components/LibraryView.qml</file>
+        <file>assets/components/NowPlayingPanel.qml</file>
+        <file>assets/components/PlaybackPanel.qml</file>
+        <file>assets/components/TrackHeader.qml</file>
+        <file>assets/components/TrackListDelegate.qml</file>
+        <file>assets/components/TrackListView.qml</file>
+        <file>assets/components/TrackView.qml</file>
         <file>assets/main.qml</file>
     </qresource>
 </RCC>
