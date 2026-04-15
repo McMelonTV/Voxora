@@ -922,6 +922,122 @@ func isUsableCachedStream(path string) bool {
 	return true
 }
 
+func touchStreamCacheEntry(path string) {
+	clean := strings.TrimSpace(path)
+	if clean == "" {
+		return
+	}
+	now := time.Now()
+	_ = os.Chtimes(clean, now, now)
+	if doneMarkerPath := streamCacheDoneMarkerPathForStream(clean); doneMarkerPath != "" {
+		_ = os.Chtimes(doneMarkerPath, now, now)
+	}
+}
+
+func streamCacheProtectedPaths(activePath string) map[string]struct{} {
+	protected := make(map[string]struct{}, 3)
+	clean := strings.TrimSpace(activePath)
+	if clean == "" {
+		return protected
+	}
+	protected[clean] = struct{}{}
+
+	switch {
+	case strings.HasSuffix(clean, ".stream.play.ogg"):
+		protected[strings.TrimSuffix(clean, ".stream.play.ogg")+".stream.ogg"] = struct{}{}
+	case strings.HasSuffix(clean, ".stream.ogg"):
+		protected[strings.TrimSuffix(clean, ".stream.ogg")+".stream.play.ogg"] = struct{}{}
+	}
+
+	return protected
+}
+
+func isTransientStreamCachePath(path string) bool {
+	clean := strings.TrimSpace(path)
+	if clean == "" {
+		return false
+	}
+	lower := strings.ToLower(clean)
+	return strings.HasSuffix(lower, ".stream.play.ogg") ||
+		strings.HasSuffix(lower, ".stream.ogg.part") ||
+		strings.HasSuffix(lower, ".prefetch.part") ||
+		strings.HasSuffix(lower, ".live.fifo")
+}
+
+func removeStreamCacheEntry(path string) {
+	clean := strings.TrimSpace(path)
+	if clean == "" {
+		return
+	}
+	_ = os.Remove(clean)
+	if doneMarkerPath := streamCacheDoneMarkerPathForStream(clean); doneMarkerPath != "" {
+		_ = os.Remove(doneMarkerPath)
+	}
+}
+
+func cleanupStreamCacheArtifacts(cacheDir string, protected map[string]struct{}) int {
+	cleanDir := strings.TrimSpace(cacheDir)
+	if cleanDir == "" {
+		return 0
+	}
+
+	removed := 0
+	_ = filepath.WalkDir(cleanDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+
+		clean := strings.TrimSpace(path)
+		if clean == "" {
+			return nil
+		}
+		lowerName := strings.ToLower(d.Name())
+
+		switch {
+		case isTransientStreamCachePath(clean):
+			if _, keep := protected[clean]; keep {
+				return nil
+			}
+			if err := os.Remove(clean); err == nil {
+				removed++
+			}
+		case strings.HasSuffix(lowerName, ".stream.ogg.done"):
+			streamPath := strings.TrimSuffix(clean, ".done")
+			if _, keep := protected[streamPath]; keep {
+				return nil
+			}
+			if !isUsableCachedStream(streamPath) {
+				if err := os.Remove(clean); err == nil {
+					removed++
+				}
+			}
+		case strings.HasSuffix(lowerName, ".stream.ogg"):
+			if _, keep := protected[clean]; keep {
+				return nil
+			}
+			if !isUsableCachedStream(clean) {
+				beforeRemoved := removed
+				removeStreamCacheEntry(clean)
+				if _, statErr := os.Stat(clean); statErr != nil {
+					removed++
+				}
+				if doneMarkerPath := streamCacheDoneMarkerPathForStream(clean); doneMarkerPath != "" {
+					if _, statErr := os.Stat(doneMarkerPath); statErr != nil {
+						removed++
+					}
+				}
+				if removed == beforeRemoved {
+					return nil
+				}
+			}
+		}
+
+		return nil
+	})
+
+	return removed
+}
+
 func freeDiskBytes(path string) uint64 {
 	var stat syscall.Statfs_t
 	if err := syscall.Statfs(path, &stat); err != nil {
@@ -958,27 +1074,35 @@ func (b *SpotifyBridge) pruneStreamCacheIfLowDisk(cacheDir string) {
 	if cacheDir == "" {
 		return
 	}
-	free := freeDiskBytes(cacheDir)
-	if free >= streamCacheMinFree {
-		return
-	}
 
 	b.mu.Lock()
 	active := strings.TrimSpace(b.currentStream)
 	b.mu.Unlock()
+	protected := streamCacheProtectedPaths(active)
+	_ = cleanupStreamCacheArtifacts(cacheDir, protected)
+
+	free := freeDiskBytes(cacheDir)
+	if free >= streamCacheMinFree {
+		return
+	}
 
 	files := listStreamCacheFiles(cacheDir)
 	for _, f := range files {
 		if free >= streamCacheMinFree {
 			break
 		}
-		if strings.TrimSpace(f.path) == "" || f.path == active {
+		if strings.TrimSpace(f.path) == "" {
 			continue
 		}
-		if err := os.Remove(f.path); err != nil {
+		if _, keep := protected[f.path]; keep {
 			continue
 		}
+		beforeFree := free
+		removeStreamCacheEntry(f.path)
 		free = freeDiskBytes(cacheDir)
+		if free <= beforeFree {
+			continue
+		}
 	}
 }
 
@@ -1004,9 +1128,13 @@ func (b *SpotifyBridge) clearStreamCache() {
 	}
 	fifoPath := strings.TrimSpace(b.activeStreamFIFO)
 	b.activeStreamFIFO = ""
+	currentPath := strings.TrimSpace(b.currentStream)
 	b.currentStream = ""
 	b.mu.Unlock()
 
+	if isTransientStreamCachePath(currentPath) {
+		_ = os.Remove(currentPath)
+	}
 	if fifoPath != "" {
 		_ = os.Remove(fifoPath)
 	}
@@ -1146,7 +1274,7 @@ func (b *SpotifyBridge) prebufferTracks(raw string) {
 func (b *SpotifyBridge) prebufferSingleTrack(ctx context.Context, loader *libspotdl.Downloader, trackURI string) {
 	outputPath := streamCachePathForURI(trackURI)
 	if isUsableCachedStream(outputPath) {
-		_ = os.Chtimes(outputPath, time.Now(), time.Now())
+		touchStreamCacheEntry(outputPath)
 		return
 	}
 
@@ -1245,7 +1373,7 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 		cacheURL = outputPath
 	}
 	if isUsableCachedStream(outputPath) {
-		_ = os.Chtimes(outputPath, time.Now(), time.Now())
+		touchStreamCacheEntry(outputPath)
 		if info, statErr := os.Stat(outputPath); statErr == nil {
 			b.mu.Lock()
 			b.streamBufferedLatest = info.Size()
