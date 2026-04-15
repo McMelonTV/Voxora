@@ -36,11 +36,12 @@ type SpotifyBridge struct {
 	flowCtx    context.Context
 	flowCancel context.CancelFunc
 
-	trackContextURI string
-	trackPageOffset int
-	trackPageLimit  int
-	trackItems      []libspotdl.LibraryTrackSummary
-	loadingTracks   bool
+	trackContextURI  string
+	trackSearchQuery string
+	trackPageOffset  int
+	trackPageLimit   int
+	trackItems       []libspotdl.LibraryTrackSummary
+	loadingTracks    bool
 
 	downloadedByURI    map[string]string
 	downloadedArtByURI map[string]string
@@ -104,6 +105,7 @@ func NewSpotifyBridge() *SpotifyBridge {
 	b.set("clearStreamNonce", 0)
 	b.set("clearStreamCacheAllNonce", 0)
 	b.set("openCollectionRequest", "")
+	b.set("searchTracksRequest", "")
 	b.set("loadMoreTracksNonce", 0)
 	b.set("navigateBackNonce", 0)
 	b.set("startAuthNonce", 0)
@@ -114,6 +116,8 @@ func NewSpotifyBridge() *SpotifyBridge {
 			go b.startFlow()
 		case "openCollectionRequest":
 			go b.openCollection(value.ToString())
+		case "searchTracksRequest":
+			go b.searchTracks(value.ToString())
 		case "loadMoreTracksNonce":
 			go b.loadMoreTracks()
 		case "downloadTrackRequest":
@@ -647,6 +651,40 @@ func (b *SpotifyBridge) loadLibrary() {
 	b.set("libraryStatus", fmt.Sprintf("Spotify library: playlists loaded (%d), liked songs unavailable", len(snapshot.Playlists)))
 }
 
+func (b *SpotifyBridge) handleTrackLoadError(err error, sourceLabel string) bool {
+	errText := strings.ToLower(strings.TrimSpace(err.Error()))
+	cleanSource := strings.TrimSpace(sourceLabel)
+	if cleanSource == "" {
+		cleanSource = "tracks"
+	}
+
+	setReauthState := func(statusText, trackStatus string) {
+		b.set("state", "idle")
+		b.set("lastError", err.Error())
+		b.set("statusText", statusText)
+		b.set("trackListStatus", trackStatus)
+		go b.startFlow()
+	}
+
+	switch {
+	case strings.Contains(errText, "no cached spotify oauth access token") || strings.Contains(errText, "status 401"):
+		setReauthState("Spotify auth: session expired, reauth needed", fmt.Sprintf("Spotify %s: re-authenticate to refresh access token", cleanSource))
+		return true
+	case strings.Contains(errText, "insufficient client scope"):
+		setReauthState("Spotify auth: additional permissions required, reauth needed", fmt.Sprintf("Spotify %s: re-authenticate to grant required permissions", cleanSource))
+		return true
+	case libspotdl.IsSpotifyCredentialRefusedError(err):
+		setReauthState("Spotify auth: cached credentials rejected, reauth required", fmt.Sprintf("Spotify %s: requires re-authentication", cleanSource))
+		return true
+	case strings.Contains(errText, "status 429") || strings.Contains(errText, "rate limit"):
+		b.set("lastError", err.Error())
+		b.set("trackListStatus", fmt.Sprintf("Spotify %s: rate limited by Spotify, please wait and retry", cleanSource))
+		return true
+	default:
+		return false
+	}
+}
+
 func (b *SpotifyBridge) openCollection(raw string) {
 	parts := strings.SplitN(raw, "\n", 3)
 	if len(parts) < 2 {
@@ -673,8 +711,41 @@ func (b *SpotifyBridge) openCollection(raw string) {
 
 	b.mu.Lock()
 	b.trackContextURI = contextURI
+	b.trackSearchQuery = ""
 	b.trackPageOffset = 0
 	b.trackPageLimit = 80
+	b.trackItems = nil
+	b.loadingTracks = false
+	b.mu.Unlock()
+
+	b.loadNextTrackPage()
+}
+
+func (b *SpotifyBridge) searchTracks(raw string) {
+	parts := strings.SplitN(raw, "\n", 2)
+	if len(parts) < 1 {
+		return
+	}
+
+	query := strings.TrimSpace(parts[0])
+	if query == "" {
+		return
+	}
+
+	b.set("isLoadingTracks", true)
+	b.set("trackListTitle", "Search: "+query)
+	b.set("trackListStatus", "Searching songs...")
+	b.set("trackListJson", "[]")
+	b.set("trackHasMore", false)
+	b.set("trackTotal", 0)
+	b.set("lastError", "")
+	b.set("viewMode", "tracks")
+
+	b.mu.Lock()
+	b.trackContextURI = ""
+	b.trackSearchQuery = query
+	b.trackPageOffset = 0
+	b.trackPageLimit = 10
 	b.trackItems = nil
 	b.loadingTracks = false
 	b.mu.Unlock()
@@ -689,13 +760,18 @@ func (b *SpotifyBridge) loadMoreTracks() {
 func (b *SpotifyBridge) loadNextTrackPage() {
 	b.mu.Lock()
 	contextURI := strings.TrimSpace(b.trackContextURI)
+	searchQuery := strings.TrimSpace(b.trackSearchQuery)
 	offset := b.trackPageOffset
 	limit := b.trackPageLimit
 	if limit <= 0 {
-		limit = 80
+		if searchQuery != "" {
+			limit = 10
+		} else {
+			limit = 80
+		}
 		b.trackPageLimit = limit
 	}
-	if contextURI == "" || b.loadingTracks {
+	if (contextURI == "" && searchQuery == "") || b.loadingTracks {
 		b.mu.Unlock()
 		return
 	}
@@ -704,9 +780,17 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 
 	b.set("isLoadingTracks", true)
 	if offset == 0 {
-		b.set("trackListStatus", "Loading tracks...")
+		if searchQuery != "" {
+			b.set("trackListStatus", "Searching songs...")
+		} else {
+			b.set("trackListStatus", "Loading tracks...")
+		}
 	} else {
-		b.set("trackListStatus", "Loading more tracks...")
+		if searchQuery != "" {
+			b.set("trackListStatus", "Loading more songs...")
+		} else {
+			b.set("trackListStatus", "Loading more tracks...")
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -723,19 +807,33 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 		return
 	}
 
-	page, err := libspotdl.FetchContextTrackSummariesPageWithDownloader(ctx, downloader, contextURI, offset, limit)
+	var page libspotdl.LibraryTrackPage
+	if searchQuery != "" {
+		page, err = libspotdl.SearchTrackSummariesPageWithDownloader(ctx, downloader, searchQuery, offset, limit)
+	} else {
+		page, err = libspotdl.FetchContextTrackSummariesPageWithDownloader(ctx, downloader, contextURI, offset, limit)
+	}
 	if err != nil {
 		b.mu.Lock()
 		b.loadingTracks = false
 		b.mu.Unlock()
 		b.set("isLoadingTracks", false)
-		b.set("trackListStatus", "Failed loading tracks")
-		b.set("lastError", err.Error())
+		if searchQuery != "" {
+			if !b.handleTrackLoadError(err, "search") {
+				b.set("trackListStatus", "Failed loading tracks")
+				b.set("lastError", err.Error())
+			}
+		} else {
+			if !b.handleTrackLoadError(err, "tracks") {
+				b.set("trackListStatus", "Failed loading tracks")
+				b.set("lastError", err.Error())
+			}
+		}
 		return
 	}
 
 	b.mu.Lock()
-	if contextURI != b.trackContextURI {
+	if contextURI != strings.TrimSpace(b.trackContextURI) || searchQuery != strings.TrimSpace(b.trackSearchQuery) {
 		b.loadingTracks = false
 		b.mu.Unlock()
 		b.set("isLoadingTracks", false)
@@ -760,16 +858,30 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 	b.set("trackTotal", page.Total)
 	loadedCount := len(allTracks)
 	if page.HasMore {
+		itemLabel := "tracks"
+		if searchQuery != "" {
+			itemLabel = "songs"
+		}
 		if page.Total > 0 {
-			b.set("trackListStatus", fmt.Sprintf("Loaded %d of %d tracks", loadedCount, page.Total))
+			b.set("trackListStatus", fmt.Sprintf("Loaded %d of %d %s", loadedCount, page.Total, itemLabel))
 		} else {
-			b.set("trackListStatus", fmt.Sprintf("Loaded %d tracks", loadedCount))
+			b.set("trackListStatus", fmt.Sprintf("Loaded %d %s", loadedCount, itemLabel))
 		}
 	} else {
-		if page.Total > 0 {
-			b.set("trackListStatus", fmt.Sprintf("Loaded %d tracks", loadedCount))
+		if searchQuery != "" && loadedCount == 0 {
+			b.set("trackListStatus", fmt.Sprintf("No songs found for \"%s\"", searchQuery))
+		} else if page.Total > 0 {
+			if searchQuery != "" {
+				b.set("trackListStatus", fmt.Sprintf("Loaded %d songs", loadedCount))
+			} else {
+				b.set("trackListStatus", fmt.Sprintf("Loaded %d tracks", loadedCount))
+			}
 		} else {
-			b.set("trackListStatus", fmt.Sprintf("Loaded %d tracks", loadedCount))
+			if searchQuery != "" {
+				b.set("trackListStatus", fmt.Sprintf("Loaded %d songs", loadedCount))
+			} else {
+				b.set("trackListStatus", fmt.Sprintf("Loaded %d tracks", loadedCount))
+			}
 		}
 	}
 	b.set("isLoadingTracks", false)
