@@ -1,19 +1,24 @@
 import QtQuick
+import QtQuick.Controls
 
-Rectangle {
+Pane {
+    id: root
+
     property string currentTrackAlbumArtUrl: ""
     property string currentTrackTitle: ""
     property string currentTrackArtist: ""
 
-    width: parent ? parent.width : 0
-    height: 74
-    color: "#0d141f"
-    border.color: "#22324d"
-    border.width: 1
+    padding: 8
 
-    Row {
-        anchors.fill: parent
-        anchors.margins: 8
+    background: Rectangle {
+        color: "#0d141f"
+        border.color: "#22324d"
+        border.width: 1
+    }
+
+    contentItem: Row {
+        id: nowPlayingRow
+        width: root.availableWidth
         spacing: 10
 
         Rectangle {
@@ -28,7 +33,7 @@ Rectangle {
             Image {
                 id: nowPlayingArtImage
                 anchors.fill: parent
-                source: currentTrackAlbumArtUrl
+                source: root.currentTrackAlbumArtUrl
                 fillMode: Image.PreserveAspectCrop
                 asynchronous: true
                 cache: true
@@ -45,13 +50,13 @@ Rectangle {
         }
 
         Column {
-            width: Math.max(120, parent.width - 56 - 10)
+            width: Math.max(120, root.availableWidth - 56 - 10)
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2
 
             Text {
                 width: parent.width
-                text: currentTrackTitle.length > 0 ? currentTrackTitle : "Nothing playing"
+                text: root.currentTrackTitle.length > 0 ? root.currentTrackTitle : "Nothing playing"
                 color: "#e8edf5"
                 elide: Text.ElideRight
                 font.pixelSize: 14
@@ -60,11 +65,11 @@ Rectangle {
 
             Text {
                 width: parent.width
-                text: currentTrackArtist
+                text: root.currentTrackArtist
                 color: "#8ea4c2"
                 elide: Text.ElideRight
                 font.pixelSize: 12
-                visible: currentTrackArtist.length > 0
+                visible: root.currentTrackArtist.length > 0
             }
         }
     }

@@ -1,7 +1,8 @@
 import QtQuick
 import QtQuick.Controls
 
-Rectangle {
+Pane {
+    id: root
     objectName: "playbackPanelRoot"
     property int currentTrackIndex: -1
     property int trackCount: 0
@@ -12,6 +13,8 @@ Rectangle {
     property string leftTimeText: "0:00"
     property string rightTimeText: "0:00"
     property bool seekEnabledForCurrentSource: true
+    property real userVolume: 0.8
+    property bool showVolumeSlider: Qt.platform.os !== "android"
 
     signal seekPressed(real mouseX, real width)
     signal seekMoved(real mouseX, real width, int buttons)
@@ -20,16 +23,20 @@ Rectangle {
     signal previousRequested()
     signal playPauseRequested()
     signal nextRequested()
+    signal userVolumeChangedByUser(real value)
+    signal userVolumeDragStateChanged(bool dragging)
 
-    width: parent ? parent.width : 0
-    height: 122
-    color: "#101724"
-    border.color: "#25344f"
-    border.width: 1
+    padding: 8
 
-    Column {
-        anchors.fill: parent
-        anchors.margins: 8
+    background: Rectangle {
+        color: "#101724"
+        border.color: "#25344f"
+        border.width: 1
+    }
+
+    contentItem: Column {
+        id: playbackColumn
+        width: root.availableWidth
         spacing: 8
 
         Rectangle {
@@ -94,7 +101,7 @@ Rectangle {
 
         Item {
             width: parent.width
-            height: 40
+            height: 34
 
             Row {
                 anchors.centerIn: parent
@@ -122,6 +129,32 @@ Rectangle {
                     text: "Next"
                     enabled: currentTrackIndex >= 0 && currentTrackIndex < (trackCount - 1)
                     onClicked: nextRequested()
+                }
+            }
+
+            Slider {
+                id: volumeSlider
+                objectName: "playbackVolumeSlider"
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                visible: root.showVolumeSlider
+                enabled: root.showVolumeSlider
+                width: 120
+                from: 0
+                to: 1
+                value: root.userVolume
+                onMoved: root.userVolumeChangedByUser(value)
+                onPressedChanged: root.userVolumeDragStateChanged(pressed)
+
+                handle: Rectangle {
+                    x: volumeSlider.leftPadding + volumeSlider.visualPosition * (volumeSlider.availableWidth - width)
+                    y: volumeSlider.topPadding + (volumeSlider.availableHeight - height) / 2
+                    width: 16
+                    height: 16
+                    radius: 8
+                    color: volumeSlider.pressed ? "#d7ecff" : "#c4dcf5"
+                    border.color: "#6f8cab"
+                    border.width: 1
                 }
             }
         }

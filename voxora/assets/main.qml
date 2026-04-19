@@ -33,6 +33,7 @@ Window {
     property int pendingResumeAttempts: 0
     property int lastHandledActionNonce: 0
     property real userVolume: 0.8
+    property bool isDraggingVolumeSlider: false
     property color actionButtonTextColor: "#1f2a38"
     property color actionButtonTextColorDisabled: "#7d8796"
     property string currentTrackTitle: ""
@@ -84,7 +85,14 @@ Window {
     signal uiComputePrebufferRequested()
     signal uiEvaluateRecoveryRequested()
     property real playbackProgress: effectiveDurationMs > 0 ? Math.max(0, Math.min(1, localPlayer.position / effectiveDurationMs)) : 0
-    property bool usingStreamSource: currentPlayingPath.length > 0 && currentPlayingPath === (spotifyAuthBridge.streamPlayPath || "")
+    property bool usingStreamSource: {
+        if (currentPlayingPath.length === 0) {
+            return false
+        }
+        var playPath = spotifyAuthBridge.streamPlayPath || ""
+        var cachePath = spotifyAuthBridge.streamCacheFilePath || spotifyAuthBridge.streamCachePath || ""
+        return currentPlayingPath === playPath || (cachePath.length > 0 && currentPlayingPath === cachePath)
+    }
     property bool streamFullyBuffered: {
         if (!usingStreamSource) {
             return true
@@ -97,6 +105,9 @@ Window {
         return !spotifyAuthBridge.isStreamingTrack
     }
     property bool seekEnabledForCurrentSource: !usingStreamSource || streamFullyBuffered
+    property bool streamCacheReady: !!spotifyAuthBridge.streamCacheReady
+    property int streamBufferedBytes: Number(spotifyAuthBridge.streamBufferedBytes) || 0
+    property int streamBufferedTotal: Number(spotifyAuthBridge.streamBufferedTotal) || 0
     property real bufferedProgressLatched: 0
     property real streamFetchProgress: {
         var total = Number(spotifyAuthBridge.streamBufferedTotal)
@@ -163,6 +174,9 @@ Window {
             bridgeActionNonce = Number(spotifyAuthBridge.actionNonce) || 0
         }
         function onSessionUserVolumeChanged() {
+            if (root.isDraggingVolumeSlider) {
+                return
+            }
             var next = Number(spotifyAuthBridge.sessionUserVolume)
             if (!isNaN(next)) {
                 userVolume = Math.max(0, Math.min(1, next))
@@ -278,9 +292,16 @@ Window {
         onConnectSpotifyRequested: root.uiConnectSpotifyRequested()
         onClearStreamCacheRequested: root.uiClearStreamCacheRequested()
         onUserVolumeChangedByUser: function(value) {
-            root.userVolume = Math.max(0, Math.min(1, Number(value) || 0.8))
+            var nextVolume = Number(value)
+            if (isNaN(nextVolume)) {
+                nextVolume = 0.8
+            }
+            root.userVolume = Math.max(0, Math.min(1, nextVolume))
             root.uiPendingVolume = value
             root.uiVolumeChangedRequested()
+        }
+        onUserVolumeDragStateChanged: function(dragging) {
+            root.isDraggingVolumeSlider = !!dragging
         }
         onDataSavingModeToggled: {
             root.dataSavingMode = !root.dataSavingMode

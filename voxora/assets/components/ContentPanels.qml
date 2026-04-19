@@ -1,5 +1,6 @@
 import QtQuick
 import QtMultimedia
+import QtQuick.Layouts
 
 Item {
     id: root
@@ -39,11 +40,131 @@ Item {
     signal previousRequested()
     signal playPauseRequested()
     signal nextRequested()
+    signal userVolumeDragStateChanged(bool dragging)
 
-    Loader {
-        id: contentLoader
+    ListModel {
+        id: internalTrackModel
+    }
+
+    property var trackListData: {
+        try {
+            return JSON.parse(root.bridge.trackListJson)
+        } catch (e) {
+            return []
+        }
+    }
+
+    function normalizeTrackItem(item) {
+        return {
+            Name: item && item.Name ? item.Name : "",
+            URI: item && item.URI ? item.URI : "",
+            ArtistText: item && item.ArtistText ? item.ArtistText : "",
+            AlbumArtURL: item && item.AlbumArtURL ? item.AlbumArtURL : "",
+            DownloadedPath: item && item.DownloadedPath ? item.DownloadedPath : "",
+            DurationMs: item && item.DurationMs ? Number(item.DurationMs) : 0
+        }
+    }
+
+    function syncTrackListModel(items) {
+        var incoming = Array.isArray(items) ? items : []
+        if (incoming.length === 0) {
+            if (internalTrackModel.count > 0) {
+                internalTrackModel.clear()
+            }
+            return
+        }
+
+        var existingCount = internalTrackModel.count
+        var canAppendOnly = existingCount > 0 && incoming.length >= existingCount
+
+        if (canAppendOnly) {
+            for (var i = 0; i < existingCount; i += 1) {
+                var existing = internalTrackModel.get(i)
+                var next = incoming[i] || {}
+                var sameIdentity = (existing.URI || "") === (next.URI || "")
+                    && (existing.Name || "") === (next.Name || "")
+                if (!sameIdentity) {
+                    canAppendOnly = false
+                    break
+                }
+            }
+        }
+
+        if (canAppendOnly) {
+            for (var appendIdx = existingCount; appendIdx < incoming.length; appendIdx += 1) {
+                internalTrackModel.append(normalizeTrackItem(incoming[appendIdx]))
+            }
+            return
+        }
+
+        internalTrackModel.clear()
+        for (var rebuildIdx = 0; rebuildIdx < incoming.length; rebuildIdx += 1) {
+            internalTrackModel.append(normalizeTrackItem(incoming[rebuildIdx]))
+        }
+    }
+
+    onTrackListDataChanged: {
+        syncTrackListModel(trackListData)
+    }
+
+    ColumnLayout {
         anchors.fill: parent
-        sourceComponent: bridge && bridge.viewMode === "tracks" ? trackListComponent : libraryListComponent
+        spacing: 0
+
+        Item {
+            id: contentArea
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            Layout.minimumHeight: 120
+
+            Loader {
+                id: contentLoader
+                anchors.fill: parent
+                sourceComponent: bridge && bridge.viewMode === "tracks" ? trackListComponent : libraryListComponent
+            }
+        }
+
+        NowPlayingPanel {
+            id: nowPlayingPanel
+            Layout.fillWidth: true
+            currentTrackAlbumArtUrl: root.currentTrackAlbumArtUrl
+            currentTrackTitle: root.currentTrackTitle
+            currentTrackArtist: root.currentTrackArtist
+        }
+
+        PlaybackPanel {
+            id: playbackPanel
+            Layout.fillWidth: true
+            currentTrackIndex: root.currentTrackIndex
+            trackCount: internalTrackModel.count
+            isPlaying: !!root.localPlayer && root.localPlayer.playbackState === MediaPlayer.PlayingState
+            hasSource: !!root.localPlayer && !!(root.localPlayer.source && root.localPlayer.source.toString().length > 0)
+            bufferedProgress: root.bufferedProgress
+            playbackProgress: root.playbackProgress
+            userVolume: root.userVolume
+            showVolumeSlider: Qt.platform.os !== "android"
+            leftTimeText: root.formatMsFn ? root.formatMsFn(root.localPlayer ? root.localPlayer.position : 0) : "0:00"
+            rightTimeText: root.formatMsFn ? root.formatMsFn(root.effectiveDurationMs) : "0:00"
+            seekEnabledForCurrentSource: root.seekEnabledForCurrentSource
+
+            onSeekPressed: function(mouseX, width) {
+                root.seekPressed(mouseX, width)
+            }
+            onSeekMoved: function(mouseX, width, buttons) {
+                root.seekMoved(mouseX, width, buttons)
+            }
+            onSeekReleased: root.seekReleased()
+            onSeekCanceled: root.seekCanceled()
+            onPreviousRequested: root.previousRequested()
+            onPlayPauseRequested: root.playPauseRequested()
+            onNextRequested: root.nextRequested()
+            onUserVolumeChangedByUser: function(value) {
+                root.userVolumeChangedByUser(value)
+            }
+            onUserVolumeDragStateChanged: function(dragging) {
+                root.userVolumeDragStateChanged(dragging)
+            }
+        }
     }
 
     Component {
@@ -71,14 +192,10 @@ Item {
                 }
                 return base
             }
-            userVolume: root.userVolume
             dataSavingMode: root.dataSavingMode
 
             onConnectSpotifyRequested: root.connectSpotifyRequested()
             onClearStreamCacheRequested: root.clearStreamCacheRequested()
-            onUserVolumeChangedByUser: function(value) {
-                root.userVolumeChangedByUser(value)
-            }
             onDataSavingModeToggled: root.dataSavingModeToggled()
             onOpenCollectionRequested: function(uri, name) {
                 root.openCollectionRequested(uri, name)
@@ -89,106 +206,23 @@ Item {
     Component {
         id: trackListComponent
 
-        Column {
-            id: trackListRoot
+        TrackListPanel {
             anchors.fill: parent
-            spacing: 0
+            bridge: root.bridge
+            tracksModel: internalTrackModel
+            currentTrackIndex: root.currentTrackIndex
+            actionButtonTextColor: root.actionButtonTextColor
+            actionButtonTextColorDisabled: root.actionButtonTextColorDisabled
+            nowPlayingPanelHeight: 0
+            playbackPanelHeight: 0
 
-            ListModel {
-                id: internalTrackModel
+            onBackRequested: root.navigateBackRequested()
+            onLoadMoreRequested: root.loadMoreRequested()
+            onPlayTrackRequested: function(index) {
+                root.playTrackRequested(index)
             }
-
-            property var trackListData: {
-                try {
-                    return JSON.parse(root.bridge.trackListJson)
-                } catch (e) {
-                    return []
-                }
-            }
-
-            function normalizeTrackItem(item) {
-                return {
-                    Name: item && item.Name ? item.Name : "",
-                    URI: item && item.URI ? item.URI : "",
-                    ArtistText: item && item.ArtistText ? item.ArtistText : "",
-                    AlbumArtURL: item && item.AlbumArtURL ? item.AlbumArtURL : "",
-                    DownloadedPath: item && item.DownloadedPath ? item.DownloadedPath : "",
-                    DurationMs: item && item.DurationMs ? Number(item.DurationMs) : 0
-                }
-            }
-
-            function syncTrackListModel(items) {
-                var incoming = Array.isArray(items) ? items : []
-                if (incoming.length === 0) {
-                    if (internalTrackModel.count > 0) {
-                        internalTrackModel.clear()
-                    }
-                    return
-                }
-                internalTrackModel.clear()
-                for (var i = 0; i < incoming.length; i += 1) {
-                    internalTrackModel.append(normalizeTrackItem(incoming[i]))
-                }
-            }
-
-            onTrackListDataChanged: {
-                syncTrackListModel(trackListData)
-            }
-
-            TrackListPanel {
-                id: trackListPanel
-                width: parent.width
-                height: Math.max(120, parent.height - nowPlayingPanel.height - playbackPanel.height)
-                bridge: root.bridge
-                tracksModel: internalTrackModel
-                currentTrackIndex: root.currentTrackIndex
-                actionButtonTextColor: root.actionButtonTextColor
-                actionButtonTextColorDisabled: root.actionButtonTextColorDisabled
-                nowPlayingPanelHeight: nowPlayingPanel.height
-                playbackPanelHeight: playbackPanel.height
-
-                onBackRequested: root.navigateBackRequested()
-                onLoadMoreRequested: root.loadMoreRequested()
-                onPlayTrackRequested: function(index) {
-                    root.playTrackRequested(index)
-                }
-                onDownloadTrackRequested: function(uri, name) {
-                    root.downloadTrackRequested(uri, name)
-                }
-            }
-
-            NowPlayingPanel {
-                id: nowPlayingPanel
-                width: parent.width
-                currentTrackAlbumArtUrl: root.currentTrackAlbumArtUrl
-                currentTrackTitle: root.currentTrackTitle
-                currentTrackArtist: root.currentTrackArtist
-            }
-
-            PlaybackPanel {
-                id: playbackPanel
-                width: parent.width
-                currentTrackIndex: root.currentTrackIndex
-                trackCount: internalTrackModel.count
-                isPlaying: !!root.localPlayer && root.localPlayer.playbackState === MediaPlayer.PlayingState
-                hasSource: !!root.localPlayer && !!(root.localPlayer.source && root.localPlayer.source.toString().length > 0)
-                bufferedProgress: root.bufferedProgress
-                playbackProgress: root.playbackProgress
-                leftTimeText: root.formatMsFn ? root.formatMsFn(root.localPlayer ? root.localPlayer.position : 0) : "0:00"
-                rightTimeText: root.formatMsFn ? root.formatMsFn(root.effectiveDurationMs) : "0:00"
-                seekEnabledForCurrentSource: root.seekEnabledForCurrentSource
-
-                onSeekPressed: function(mouseX, width) {
-                    root.seekPressed(mouseX, width)
-                }
-                onSeekMoved: function(mouseX, width, buttons) {
-                    root.seekMoved(mouseX, width, buttons)
-                }
-                onSeekReleased: root.seekReleased()
-                onSeekCanceled: root.seekCanceled()
-                onPreviousRequested: root.previousRequested()
-                onPlayPauseRequested: root.playPauseRequested()
-                onNextRequested: root.nextRequested()
+            onDownloadTrackRequested: function(uri, name) {
+                root.downloadTrackRequested(uri, name)
             }
         }
     }

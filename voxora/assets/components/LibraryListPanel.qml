@@ -5,12 +5,10 @@ Column {
     objectName: "libraryListPanelRoot"
     property var bridge
     property var libraryListEntries: []
-    property real userVolume: 0.8
     property bool dataSavingMode: false
 
     signal connectSpotifyRequested()
     signal clearStreamCacheRequested()
-    signal userVolumeChangedByUser(real value)
     signal dataSavingModeToggled()
     signal openCollectionRequested(string uri, string name)
 
@@ -54,29 +52,10 @@ Column {
                 wrapMode: Text.WrapAnywhere
             }
 
-            Row {
-                spacing: 10
-
-                Text {
-                    text: "Volume"
-                    color: "#8ea4c2"
-                    verticalAlignment: Text.AlignVCenter
-                }
-
-                Slider {
-                    objectName: "volumeSlider"
-                    width: 160
-                    from: 0
-                    to: 1
-                    value: userVolume
-                    onValueChanged: userVolumeChangedByUser(value)
-                }
-
-                Button {
-                    objectName: "clearStreamCacheButton"
-                    text: "Clear Stream Cache"
-                    onClicked: clearStreamCacheRequested()
-                }
+            Button {
+                objectName: "clearStreamCacheButton"
+                text: "Clear Stream Cache"
+                onClicked: clearStreamCacheRequested()
             }
 
             Row {
