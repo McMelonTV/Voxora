@@ -64,11 +64,15 @@ func app_main() {
 	qt.NewQGuiApplication(os.Args)
 
 	engine := qml.NewQQmlApplicationEngine()
+	engine.AddImportPath("assets")
+	engine.AddImportPath("qrc:/assets")
 	if runtime.GOOS == "android" {
 		engine.AddImportPath(":/qt-project.org/imports")
 		engine.AddImportPath("qrc:/qt-project.org/imports")
 		engine.AddImportPath("assets:/qt-project.org/imports")
 		engine.AddImportPath("assets:/qml")
+		engine.AddImportPath("assets:/assets")
+		engine.AddImportPath("qrc:/assets")
 		if androidLibDir != "" {
 			engine.AddPluginPath(androidLibDir)
 		}
@@ -131,13 +135,22 @@ func app_main() {
 	engine.RootContext().SetContextProperty("spotifyAuthBridge", spotifyBridge.Object().QObject)
 
 	engine.Load(url)
+	if roots := engine.RootObjects(); len(roots) > 0 {
+		spotifyBridge.AttachUISignals(roots[0])
+	}
 	if runtime.GOOS == "android" && len(engine.RootObjects()) == 0 {
 		// Android package layouts vary; fallback to root-level main.qml if assets/ prefix is absent.
 		engine.Load(qt.NewQUrl3("qrc:/main.qml"))
+		if roots := engine.RootObjects(); len(roots) > 0 {
+			spotifyBridge.AttachUISignals(roots[0])
+		}
 	}
 	if runtime.GOOS == "android" && len(engine.RootObjects()) == 0 {
 		// Final fallback: load from APK assets copied by android-build.sh.
 		engine.Load(qt.NewQUrl3("assets:/main.qml"))
+		if roots := engine.RootObjects(); len(roots) > 0 {
+			spotifyBridge.AttachUISignals(roots[0])
+		}
 	}
 	qt.QGuiApplication_Exec()
 }

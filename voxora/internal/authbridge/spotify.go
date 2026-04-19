@@ -17,30 +17,43 @@ import (
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	libspotdl "github.com/McMelonTV/Voxora/libspotd"
+	"github.com/McMelonTV/Voxora/voxora/internal/appapi"
 	"github.com/dhowden/tag"
 	qt "github.com/mappu/miqt/qt6"
 	"github.com/mappu/miqt/qt6/qml"
 )
 
 type SpotifyBridge struct {
-	props *qml.QQmlPropertyMap
+	props           *qml.QQmlPropertyMap
+	uiSignalMappers []*qt.QSignalMapper
+	uiRoot          *qt.QObject
+
+	sessionMgr  *appapi.SessionManager
+	navMgr      *appapi.NavigationStackManager
+	trackModel  *appapi.TrackModelManager
+	playbackMgr *appapi.PlaybackManager
+	streamMgr   *appapi.StreamManager
 
 	mu         sync.Mutex
 	flow       *libspotdl.InteractiveAuthFlow
 	flowCtx    context.Context
 	flowCancel context.CancelFunc
 
-	trackContextURI string
-	trackPageOffset int
-	trackPageLimit  int
-	trackItems      []libspotdl.LibraryTrackSummary
-	loadingTracks   bool
+	trackContextURI      string
+	trackPageOffset      int
+	trackPageLimit       int
+	trackItems           []libspotdl.LibraryTrackSummary
+	loadingTracks        bool
+	resumeActive         bool
+	resumeTargetTrackURI string
+	resumeTargetPosMs    int
 
 	downloadedByURI    map[string]string
 	downloadedArtByURI map[string]string
@@ -59,26 +72,50 @@ type SpotifyBridge struct {
 	activeStreamWrite    *os.File
 	streamBufferedLatest int64
 
-	streamHTTPListener net.Listener
-	streamHTTPServer   *http.Server
-	streamHTTPBaseURL  string
+	streamHTTPListener     net.Listener
+	streamHTTPServer       *http.Server
+	streamHTTPBaseURL      string
+	debugBridgeProps       bool
+	debugPlayback          bool
+	sessionLoadedSeq       int
+	actionSeq              int
+	playbackIntentSeq      int
+	seekDecisionSeq        int
+	openCollectionReqSeq   int
+	streamTrackReqSeq      int
+	startPlaybackReqSeq    int
+	playAdjacentReqSeq     int
+	computePrebufferReqSeq int
+	navOpenReqSeq          int
+	navBackReqSeq          int
+	clearSessionReqSeq     int
+	loadMoreTracksReqSeq   int
+	prebufferTracksReqSeq  int
 }
 
 func NewSpotifyBridge() *SpotifyBridge {
 	props := qml.NewQQmlPropertyMap()
-	b := &SpotifyBridge{props: props, downloadedByURI: make(map[string]string), downloadedArtByURI: make(map[string]string)}
+	b := &SpotifyBridge{
+		props:              props,
+		sessionMgr:         appapi.NewSessionManager(),
+		navMgr:             appapi.NewNavigationStackManager(),
+		trackModel:         appapi.NewTrackModelManager(),
+		playbackMgr:        appapi.NewPlaybackManager(),
+		streamMgr:          appapi.NewStreamManager(),
+		downloadedByURI:    make(map[string]string),
+		downloadedArtByURI: make(map[string]string),
+	}
+	b.debugBridgeProps = strings.EqualFold(strings.TrimSpace(os.Getenv("VOXORA_DEBUG_BRIDGE_PROPS")), "1") || strings.EqualFold(strings.TrimSpace(os.Getenv("VOXORA_DEBUG_BRIDGE_PROPS")), "true")
+	debugPlaybackEnv := strings.TrimSpace(os.Getenv("VOXORA_DEBUG_PLAYBACK"))
+	b.debugPlayback = strings.EqualFold(debugPlaybackEnv, "1") || strings.EqualFold(debugPlaybackEnv, "true")
 	b.startStreamHTTPServer()
 
-	b.set("state", "idle")
 	b.set("statusText", "Spotify auth: idle")
 	b.set("isBusy", false)
-	b.set("username", "")
 	b.set("lastError", "")
-	b.set("authUrl", "")
 	b.set("likedSongsCount", 0)
 	b.set("likedSongsName", "Liked Songs")
 	b.set("playlistsJson", "[]")
-	b.set("playlistsCount", 0)
 	b.set("libraryStatus", "Spotify library: not loaded")
 	b.set("viewMode", "library")
 	b.set("trackListJson", "[]")
@@ -86,13 +123,10 @@ func NewSpotifyBridge() *SpotifyBridge {
 	b.set("trackListStatus", "")
 	b.set("isLoadingTracks", false)
 	b.set("trackHasMore", false)
-	b.set("trackTotal", 0)
 	b.set("isDownloadingTrack", false)
 	b.set("downloadTrackRequest", "")
 	b.set("isStreamingTrack", false)
 	b.set("streamTrackRequest", "")
-	b.set("prebufferTrackRequest", "")
-	b.set("prebufferTracksRequest", "")
 	b.set("clearPrebufferNonce", 0)
 	b.set("streamPlayPath", "")
 	b.set("streamPlayReadyNonce", 0)
@@ -103,36 +137,112 @@ func NewSpotifyBridge() *SpotifyBridge {
 	b.set("streamBufferedTotal", int64(0))
 	b.set("clearStreamNonce", 0)
 	b.set("clearStreamCacheAllNonce", 0)
-	b.set("openCollectionRequest", "")
-	b.set("loadMoreTracksNonce", 0)
-	b.set("navigateBackNonce", 0)
+	b.set("uiIntentRequest", "")
 	b.set("startAuthNonce", 0)
+	b.set("loadSessionNonce", 0)
+	b.set("saveSessionNonce", 0)
+	b.set("clearSessionNonce", 0)
+	b.set("sessionContextURI", "")
+	b.set("sessionContextName", "")
+	b.set("sessionTrackURI", "")
+	b.set("sessionTrackName", "")
+	b.set("sessionTrackArtist", "")
+	b.set("sessionAlbumArtURL", "")
+	b.set("sessionPositionMs", 0)
+	b.set("sessionUserVolume", 0.8)
+	b.set("sessionDataSavingMode", false)
+	b.set("sessionLoadedNonce", 0)
+	b.set("navDepth", 0)
+	b.set("navCanGoBack", false)
+	b.set("activeContextURI", "")
+	b.set("activeContextName", "")
+	b.set("trackModelVersion", 0)
+	b.set("trackModelCount", 0)
+	b.set("currentTrackIndex", -1)
+	b.set("currentTrackURI", "")
+	b.set("startPlaybackRequest", "")
+	b.set("playAdjacentRequest", "")
+	b.set("openCollectionRequest", "")
+	b.set("navOpenRequest", "")
+	b.set("navigateBackNonce", 0)
+	b.set("navBackNonce", 0)
+	b.set("loadMoreTracksNonce", 0)
+	b.set("prebufferTracksRequest", "")
+	b.set("computePrebufferNonce", 0)
+	b.set("computePrebufferRequest", "")
+	b.set("evaluateSeekRequest", "")
+	b.set("evaluateRecoveryRequest", "")
+	b.set("seekAllowed", false)
+	b.set("seekDenyReason", "")
+	b.set("seekDecisionNonce", 0)
+	b.set("playbackIntentJson", "")
+	b.set("playbackIntentNonce", 0)
+	b.set("actionKind", "")
+	b.set("actionReason", "")
+	b.set("actionTargetPath", "")
+	b.set("actionTargetPosMs", 0)
+	b.set("actionTargetRatio", 0.0)
+	b.set("actionTrackIndex", -1)
+	b.set("actionShouldPlay", true)
+	b.set("actionTrackName", "")
+	b.set("actionTrackURI", "")
+	b.set("actionTrackArtistText", "")
+	b.set("actionTrackAlbumArtURL", "")
+	b.set("actionTrackDownloadedPath", "")
+	b.set("actionTrackDurationMs", 0)
+	b.set("actionNonce", 0)
+
+	b.publishSessionState()
+	b.publishNavigationState()
+	b.publishTrackModelState()
 
 	props.OnValueChanged(func(key string, value *qt.QVariant) {
+		if b.debugBridgeProps {
+			fmt.Printf("[voxora][bridge] valueChanged key=%s value=%q\n", key, strings.TrimSpace(value.ToString()))
+		}
 		switch key {
 		case "startAuthNonce":
 			go b.startFlow()
-		case "openCollectionRequest":
-			go b.openCollection(value.ToString())
-		case "loadMoreTracksNonce":
-			go b.loadMoreTracks()
+		case "uiIntentRequest":
+			go b.handleUIIntentRequest(value.ToString())
 		case "downloadTrackRequest":
 			go b.downloadTrack(value.ToString())
 		case "streamTrackRequest":
 			go b.streamTrack(value.ToString())
-		case "prebufferTrackRequest":
-			go b.prebufferTrack(value.ToString())
-		case "prebufferTracksRequest":
-			go b.prebufferTracks(value.ToString())
 		case "clearPrebufferNonce":
 			b.clearPrebuffer()
 		case "clearStreamNonce":
 			go b.clearStreamCache()
 		case "clearStreamCacheAllNonce":
 			go b.clearAllStreamCache()
-		case "navigateBackNonce":
-			b.set("viewMode", "library")
-			b.set("trackListStatus", "")
+		case "loadSessionNonce":
+			go b.loadSessionState()
+		case "saveSessionNonce":
+			go b.saveSessionStateFromBridge()
+		case "clearSessionNonce":
+			go b.clearSessionState()
+		case "openCollectionRequest":
+			go b.handleLegacyOpenCollectionRequest(value.ToString())
+		case "navOpenRequest":
+			go b.handleLegacyOpenCollectionRequest(value.ToString())
+		case "navigateBackNonce", "navBackNonce":
+			go b.handleLegacyNavigateBackNonce(key, value.ToString())
+		case "loadMoreTracksNonce":
+			go b.handleLegacyLoadMoreTracksNonce(value.ToString())
+		case "prebufferTracksRequest":
+			go b.handleLegacyPrebufferTracksRequest(value.ToString())
+		case "computePrebufferNonce":
+			go b.handleLegacyComputePrebufferNonce(value.ToString())
+		case "startPlaybackRequest":
+			b.handleStartPlaybackRequest(value.ToString())
+		case "playAdjacentRequest":
+			b.handlePlayAdjacentRequest(value.ToString())
+		case "computePrebufferRequest":
+			go b.handleComputePrebufferRequest(value.ToString())
+		case "evaluateSeekRequest":
+			b.handleEvaluateSeekRequest(value.ToString())
+		case "evaluateRecoveryRequest":
+			b.handleEvaluateRecoveryRequest(value.ToString())
 		}
 	})
 
@@ -141,6 +251,1006 @@ func NewSpotifyBridge() *SpotifyBridge {
 	go b.bootstrapExistingAuth()
 
 	return b
+}
+
+func (b *SpotifyBridge) handleUIIntentRequest(raw string) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return
+	}
+
+	parts := strings.Split(trimmed, "\n")
+	if len(parts) == 0 {
+		return
+	}
+
+	seq := 0
+	if len(parts) >= 2 {
+		if parsedSeq, err := strconv.Atoi(strings.TrimSpace(parts[len(parts)-1])); err == nil {
+			seq = parsedSeq
+			parts = parts[:len(parts)-1]
+		}
+	}
+	if !b.acceptRequestSeq("uiIntent", seq) {
+		return
+	}
+
+	kind := strings.TrimSpace(parts[0])
+	switch kind {
+	case "open_collection":
+		if len(parts) < 3 {
+			return
+		}
+		contextURI := strings.TrimSpace(parts[1])
+		title := strings.TrimSpace(parts[2])
+		if contextURI == "" {
+			return
+		}
+		if title == "" {
+			title = "Tracks"
+		}
+		b.clearResumePending()
+		fromViewMode := strings.TrimSpace(b.props.Value("viewMode").ToString())
+		b.openCollectionContext(contextURI, title, fromViewMode)
+	case "navigate_back":
+		if b.navMgr.Back() {
+			b.publishNavigationState()
+		}
+		b.set("viewMode", "library")
+		b.set("trackListStatus", "")
+	case "load_more_tracks":
+		b.loadMoreTracks()
+	}
+}
+
+func (b *SpotifyBridge) clearSessionState() {
+	if b.sessionMgr == nil {
+		return
+	}
+	if err := b.sessionMgr.Clear(); err != nil {
+		b.set("trackListStatus", "Session clear failed: "+err.Error())
+		return
+	}
+	b.publishSessionState()
+	b.set("sessionLoadedNonce", 0)
+	b.set("trackListStatus", "Session cleared")
+}
+
+func (b *SpotifyBridge) AttachUISignals(root *qt.QObject) {
+	if root == nil {
+		return
+	}
+	b.uiRoot = root
+
+	hook := func(signalName string) {
+		if strings.TrimSpace(signalName) == "" {
+			return
+		}
+		mapper := qt.NewQSignalMapper2(root)
+		b.uiSignalMappers = append(b.uiSignalMappers, mapper)
+		mapper.OnMappedString(func(name string) {
+			b.handleUISignal(strings.TrimSpace(name))
+		})
+		mapper.SetMapping2(root, signalName)
+		mapper.Connect2(root, "2"+signalName+"()", "1map()")
+	}
+
+	hook("uiConnectSpotifyRequested")
+	hook("uiClearStreamCacheRequested")
+	hook("uiVolumeChangedRequested")
+	hook("uiDataSavingToggledRequested")
+	hook("uiOpenCollectionRequested")
+	hook("uiNavigateBackRequested")
+	hook("uiLoadMoreRequested")
+	hook("uiPlayTrackRequested")
+	hook("uiDownloadTrackRequested")
+	hook("uiPreviousRequested")
+	hook("uiNextRequested")
+	hook("uiLoadSessionRequested")
+	hook("uiPersistSessionRequested")
+	hook("uiSeekRequested")
+	hook("uiClearStreamRequested")
+	hook("uiStreamTrackRequested")
+	hook("uiComputePrebufferRequested")
+	hook("uiEvaluateRecoveryRequested")
+
+	go b.loadSessionState()
+}
+
+func (b *SpotifyBridge) uiPropString(name string) string {
+	if b.uiRoot == nil {
+		return ""
+	}
+	v := b.uiRoot.Property(name)
+	if v == nil {
+		return ""
+	}
+	return strings.TrimSpace(v.ToString())
+}
+
+func (b *SpotifyBridge) uiPropInt(name string, fallback int) int {
+	raw := b.uiPropString(name)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func (b *SpotifyBridge) uiPropInt64(name string, fallback int64) int64 {
+	raw := b.uiPropString(name)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func (b *SpotifyBridge) uiPropFloat(name string, fallback float64) float64 {
+	raw := b.uiPropString(name)
+	if raw == "" {
+		return fallback
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func (b *SpotifyBridge) uiPropBool(name string, fallback bool) bool {
+	raw := b.uiPropString(name)
+	if raw == "" {
+		return fallback
+	}
+	return strings.EqualFold(raw, "true")
+}
+
+func (b *SpotifyBridge) persistSessionFromUIRoot() {
+	if b.sessionMgr == nil || b.uiRoot == nil {
+		return
+	}
+	ctxURI := b.uiPropString("activeContextURI")
+	trackURI := b.uiPropString("currentTrackURI")
+	if ctxURI == "" || trackURI == "" {
+		return
+	}
+	b.sessionMgr.Update(func(s *appapi.SessionState) {
+		s.ContextURI = ctxURI
+		s.ContextName = b.uiPropString("activeContextName")
+		s.TrackURI = trackURI
+		s.TrackName = b.uiPropString("currentTrackTitle")
+		s.TrackArtist = b.uiPropString("currentTrackArtist")
+		s.AlbumArtURL = b.uiPropString("currentTrackAlbumArtUrl")
+		s.PositionMs = b.uiPropInt("sessionPendingPositionMs", 0)
+		s.UserVolume = b.uiPropFloat("userVolume", 0.8)
+		s.DataSavingMode = b.uiPropBool("dataSavingMode", false)
+	})
+	if err := b.sessionMgr.Save(); err != nil {
+		b.set("trackListStatus", "Session save failed: "+err.Error())
+		return
+	}
+	b.publishSessionState()
+}
+
+func (b *SpotifyBridge) handleUISignal(name string) {
+	switch name {
+	case "uiConnectSpotifyRequested":
+		go b.startFlow()
+	case "uiClearStreamCacheRequested":
+		go b.clearAllStreamCache()
+	case "uiVolumeChangedRequested":
+		v := b.uiPropFloat("uiPendingVolume", 0.8)
+		if v < 0 {
+			v = 0
+		}
+		if v > 1 {
+			v = 1
+		}
+		b.set("sessionUserVolume", v)
+		go b.saveSessionStateFromBridge()
+	case "uiDataSavingToggledRequested":
+		next := b.uiPropBool("uiPendingDataSavingMode", false)
+		b.set("sessionDataSavingMode", next)
+		go b.saveSessionStateFromBridge()
+		if next {
+			b.clearPrebuffer()
+		}
+	case "uiOpenCollectionRequested":
+		uri := b.uiPropString("uiPendingCollectionURI")
+		name := b.uiPropString("uiPendingCollectionName")
+		if uri == "" {
+			return
+		}
+		if name == "" {
+			name = "Collection"
+		}
+		b.clearResumePending()
+		fromViewMode := b.uiPropString("viewMode")
+		b.openCollectionContext(uri, name, fromViewMode)
+	case "uiNavigateBackRequested":
+		if b.navMgr.Back() {
+			b.publishNavigationState()
+		}
+		b.set("viewMode", "library")
+		b.set("trackListStatus", "")
+	case "uiLoadMoreRequested":
+		b.loadMoreTracks()
+	case "uiLoadSessionRequested":
+		go b.loadSessionState()
+	case "uiPersistSessionRequested":
+		b.persistSessionFromUIRoot()
+	case "uiPlayTrackRequested":
+		idx := b.uiPropInt("uiPendingTrackIndex", -1)
+		if idx < 0 {
+			return
+		}
+		b.handleStartPlaybackRequest(strconv.Itoa(idx) + "\ntrue\n0")
+	case "uiSeekRequested":
+		ratio := b.uiPropFloat("uiPendingSeekRatio", -1)
+		if ratio < 0 {
+			return
+		}
+		durationMs := b.uiPropInt("effectiveDurationMs", 0)
+		currentPath := b.uiPropString("currentPlayingPath")
+		isPartStream := strings.EqualFold(strconv.FormatBool(strings.Contains(currentPath, ".stream") || strings.Contains(currentPath, "/stream?kind=play&")), "true")
+		seekEnabled := b.uiPropBool("seekEnabledForCurrentSource", true)
+		cacheReady := b.uiPropBool("streamCacheReady", false)
+		cachePath := strings.TrimSpace(b.props.Value("streamCacheFilePath").ToString())
+		if cachePath == "" {
+			cachePath = strings.TrimSpace(b.props.Value("streamCachePath").ToString())
+		}
+		bufferedBytes := b.uiPropInt64("streamBufferedBytes", 0)
+		if bufferedBytes == 0 {
+			bufferedBytes = int64(mustAtoiDefault(strings.TrimSpace(b.props.Value("streamBufferedBytes").ToString()), 0))
+		}
+		bufferedTotal := b.uiPropInt64("streamBufferedTotal", 0)
+		if bufferedTotal == 0 {
+			bufferedTotal = int64(mustAtoiDefault(strings.TrimSpace(b.props.Value("streamBufferedTotal").ToString()), 0))
+		}
+		b.handleEvaluateSeekRequest(strings.Join([]string{
+			strconv.FormatFloat(ratio, 'f', -1, 64),
+			strconv.Itoa(durationMs),
+			currentPath,
+			strconv.FormatBool(isPartStream),
+			strconv.FormatBool(seekEnabled),
+			strconv.FormatBool(cacheReady),
+			cachePath,
+			strconv.FormatInt(bufferedBytes, 10),
+			strconv.FormatInt(bufferedTotal, 10),
+		}, "\n"))
+	case "uiClearStreamRequested":
+		go b.clearStreamCache()
+	case "uiStreamTrackRequested":
+		uri := b.uiPropString("uiPendingStreamTrackURI")
+		trackName := b.uiPropString("uiPendingStreamTrackName")
+		if uri == "" {
+			return
+		}
+		if trackName == "" {
+			trackName = "Track"
+		}
+		go b.streamTrack(uri + "\n" + trackName)
+	case "uiComputePrebufferRequested":
+		idx := b.uiPropInt("currentTrackIndex", -1)
+		ahead := b.uiPropInt("prebufferAheadCount", 3)
+		autoplay := b.uiPropBool("autoplayEnabled", true)
+		dataSaving := b.uiPropBool("dataSavingMode", false)
+		if idx < 0 {
+			return
+		}
+		go b.handleComputePrebufferRequest(strings.Join([]string{
+			strconv.Itoa(idx),
+			strconv.Itoa(ahead),
+			strconv.FormatBool(autoplay),
+			strconv.FormatBool(dataSaving),
+			"0",
+		}, "\n"))
+	case "uiEvaluateRecoveryRequested":
+		cachePath := strings.TrimSpace(b.props.Value("streamCacheFilePath").ToString())
+		if cachePath == "" {
+			cachePath = strings.TrimSpace(b.props.Value("streamCachePath").ToString())
+		}
+		b.handleEvaluateRecoveryRequest(strings.Join([]string{
+			strconv.FormatBool(b.uiPropBool("manualStopRequested", false)),
+			strconv.FormatBool(b.uiPropBool("streamRecovering", false)),
+			strconv.FormatBool(b.uiPropBool("holdStoppedTrackState", false)),
+			strconv.FormatBool(b.uiPropBool("streamSourceSwitching", false)),
+			b.uiPropString("currentPlayingPath"),
+			cachePath,
+			strings.TrimSpace(b.props.Value("streamPlayPath").ToString()),
+			strconv.FormatBool(b.uiPropBool("uiPendingLikelyNaturalEnd", false)),
+			strconv.FormatBool(b.uiPropBool("uiPendingHasNewBufferedData", false)),
+			strconv.FormatBool(strings.EqualFold(strings.TrimSpace(b.props.Value("isStreamingTrack").ToString()), "true")),
+			strconv.Itoa(b.uiPropInt("streamRecoverAttempts", 0)),
+		}, "\n"))
+	case "uiDownloadTrackRequested":
+		uri := b.uiPropString("uiPendingDownloadURI")
+		name := b.uiPropString("uiPendingDownloadName")
+		if uri == "" {
+			return
+		}
+		if name == "" {
+			name = "Track"
+		}
+		go b.downloadTrack(uri + "\n" + name)
+	case "uiPreviousRequested":
+		current := b.uiPropInt("currentTrackIndex", -1)
+		if current < 0 {
+			return
+		}
+		b.handlePlayAdjacentRequest(strconv.Itoa(current) + "\n-1\ntrue\n0")
+	case "uiNextRequested":
+		current := b.uiPropInt("currentTrackIndex", -1)
+		if current < 0 {
+			return
+		}
+		b.handlePlayAdjacentRequest(strconv.Itoa(current) + "\n1\ntrue\n0")
+	}
+}
+
+func (b *SpotifyBridge) handleLegacyOpenCollectionRequest(raw string) {
+	parts := strings.SplitN(strings.TrimSpace(raw), "\n", 3)
+	if len(parts) < 2 {
+		return
+	}
+	contextURI := strings.TrimSpace(parts[0])
+	title := strings.TrimSpace(parts[1])
+	seq := 0
+	if len(parts) >= 3 {
+		seq, _ = strconv.Atoi(strings.TrimSpace(parts[2]))
+	}
+	if seq > 0 {
+		if !b.acceptRequestSeq("legacyNavOpen", seq) {
+			return
+		}
+	}
+	if contextURI == "" {
+		return
+	}
+	if title == "" {
+		title = "Tracks"
+	}
+	b.clearResumePending()
+	fromViewMode := strings.TrimSpace(b.props.Value("viewMode").ToString())
+	b.openCollectionContext(contextURI, title, fromViewMode)
+}
+
+func (b *SpotifyBridge) handleLegacyNavigateBackNonce(kind, raw string) {
+	seq, _ := strconv.Atoi(strings.TrimSpace(raw))
+	if seq > 0 {
+		if !b.acceptRequestSeq(kind, seq) {
+			return
+		}
+	}
+	if b.navMgr.Back() {
+		b.publishNavigationState()
+	}
+	b.set("viewMode", "library")
+	b.set("trackListStatus", "")
+}
+
+func (b *SpotifyBridge) handleLegacyLoadMoreTracksNonce(raw string) {
+	seq, _ := strconv.Atoi(strings.TrimSpace(raw))
+	if seq > 0 {
+		if !b.acceptRequestSeq("loadMoreTracksNonce", seq) {
+			return
+		}
+	}
+	b.loadMoreTracks()
+}
+
+func (b *SpotifyBridge) handleLegacyPrebufferTracksRequest(raw string) {
+	parts := strings.Split(strings.TrimSpace(raw), "\n")
+	if len(parts) == 0 {
+		return
+	}
+	if len(parts) >= 2 {
+		if seq, err := strconv.Atoi(strings.TrimSpace(parts[len(parts)-1])); err == nil {
+			if !b.acceptRequestSeq("prebufferTracksRequest", seq) {
+				return
+			}
+			parts = parts[:len(parts)-1]
+		}
+	}
+	b.prebufferTracks(strings.Join(parts, "\n"))
+}
+
+func (b *SpotifyBridge) handleLegacyComputePrebufferNonce(raw string) {
+	seq, _ := strconv.Atoi(strings.TrimSpace(raw))
+	if seq > 0 {
+		if !b.acceptRequestSeq("computePrebufferNonce", seq) {
+			return
+		}
+	}
+	b.handleComputePrebufferRequest(strings.Join([]string{
+		strings.TrimSpace(b.props.Value("currentTrackIndex").ToString()),
+		"3",
+		"true",
+		"false",
+		strconv.Itoa(seq),
+	}, "\n"))
+}
+
+func (b *SpotifyBridge) publishSessionState() {
+	if b.sessionMgr == nil {
+		return
+	}
+	s := b.sessionMgr.State()
+	b.set("sessionContextURI", s.ContextURI)
+	b.set("sessionContextName", s.ContextName)
+	b.set("sessionTrackURI", s.TrackURI)
+	b.set("sessionTrackName", s.TrackName)
+	b.set("sessionTrackArtist", s.TrackArtist)
+	b.set("sessionAlbumArtURL", b.normalizeSessionAlbumArtURL(strings.TrimSpace(s.TrackURI), strings.TrimSpace(s.AlbumArtURL)))
+	b.set("sessionPositionMs", s.PositionMs)
+	b.set("sessionUserVolume", s.UserVolume)
+	b.set("sessionDataSavingMode", s.DataSavingMode)
+}
+
+func (b *SpotifyBridge) normalizeSessionAlbumArtURL(trackURI, rawURL string) string {
+	uri := strings.TrimSpace(trackURI)
+	raw := strings.TrimSpace(rawURL)
+
+	// Prefer embedded artwork for downloaded tracks when available.
+	if uri != "" {
+		b.mu.Lock()
+		embedded := strings.TrimSpace(b.downloadedArtByURI[uri])
+		b.mu.Unlock()
+		if embedded != "" {
+			if local := b.embeddedArtworkHTTPURL(uri); local != "" {
+				return local
+			}
+		}
+	}
+
+	if raw == "" {
+		return ""
+	}
+
+	parsed, err := url.Parse(raw)
+	if err == nil {
+		host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+		if host == "127.0.0.1" || host == "localhost" {
+			if parsed.Path == "/art" {
+				q := parsed.Query()
+				if qURI := strings.TrimSpace(q.Get("uri")); qURI != "" {
+					if local := b.embeddedArtworkHTTPURL(qURI); local != "" {
+						return local
+					}
+				}
+				if qURL := strings.TrimSpace(q.Get("url")); qURL != "" {
+					if proxied := b.artworkHTTPURL(qURL); proxied != "" {
+						return proxied
+					}
+				}
+			}
+			// Any other stale localhost URL should not be reused.
+			return ""
+		}
+	}
+
+	if proxied := b.artworkHTTPURL(raw); proxied != "" {
+		return proxied
+	}
+	return raw
+}
+
+func (b *SpotifyBridge) publishNavigationState() {
+	if b.navMgr == nil {
+		return
+	}
+	state := b.navMgr.State()
+	b.set("navDepth", len(state.Stack))
+	b.set("navCanGoBack", len(state.Stack) > 0)
+	b.set("activeContextURI", state.ActiveContextURI)
+	b.set("activeContextName", state.ActiveContextName)
+}
+
+func (b *SpotifyBridge) publishTrackModelState() {
+	if b.trackModel == nil {
+		return
+	}
+	s := b.trackModel.Snapshot()
+	b.set("trackModelVersion", s.Version)
+	b.set("trackModelCount", s.Count)
+}
+
+func (b *SpotifyBridge) publishPlaybackAction(intent appapi.PlaybackIntent) {
+	b.logPlaybackf("publish index=%d shouldPlay=%t uri=%q downloaded=%t durationMs=%d", intent.Index, intent.ShouldPlay, intent.URI, strings.TrimSpace(intent.DownloadedPath) != "", intent.DurationMs)
+	b.set("currentTrackIndex", intent.Index)
+	b.set("currentTrackURI", strings.TrimSpace(intent.URI))
+	b.mu.Lock()
+	b.playbackIntentSeq += 1
+	playbackNonce := b.playbackIntentSeq
+	b.mu.Unlock()
+	if payload, err := json.Marshal(intent); err == nil {
+		b.set("playbackIntentJson", string(payload))
+	} else {
+		b.set("playbackIntentJson", "")
+	}
+	b.set("playbackIntentNonce", playbackNonce)
+	b.publishAction("playback_select", "", "", 0, 0, intent)
+}
+
+func (b *SpotifyBridge) playbackRowsForIntent() []appapi.TrackRow {
+	if b.trackModel == nil {
+		b.logPlaybackf("no rows available (trackModel unavailable)")
+		return nil
+	}
+
+	rows := b.trackModel.Rows()
+	if len(rows) == 0 {
+		b.logPlaybackf("no rows available (trackModel empty)")
+		return nil
+	}
+	b.logPlaybackf("using trackModel rows=%d", len(rows))
+	return rows
+}
+
+func (b *SpotifyBridge) handleStartPlaybackRequest(raw string) {
+	if b.playbackMgr == nil {
+		return
+	}
+	b.logPlaybackf("start request raw=%q", raw)
+	parts := strings.SplitN(raw, "\n", 3)
+	if len(parts) < 2 {
+		b.logPlaybackf("start request invalid payload")
+		b.publishAction("playback_error", "invalid startPlaybackRequest", "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+	if len(parts) >= 3 {
+		if seq, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil {
+			if !b.acceptRequestSeq("startPlayback", seq) {
+				return
+			}
+		}
+	}
+	idx, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		b.logPlaybackf("start request invalid index=%q err=%v", strings.TrimSpace(parts[0]), err)
+		b.publishAction("playback_error", "invalid playback index", "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+	shouldPlay := strings.EqualFold(strings.TrimSpace(parts[1]), "true")
+	rows := b.playbackRowsForIntent()
+	b.logPlaybackf("start resolve index=%d shouldPlay=%t rows=%d", idx, shouldPlay, len(rows))
+	intent, err := b.playbackMgr.StartAtIndex(rows, idx, shouldPlay)
+	if err != nil {
+		b.logPlaybackf("start resolve error: %v", err)
+		b.publishAction("playback_error", err.Error(), "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+	b.publishPlaybackAction(intent)
+}
+
+func (b *SpotifyBridge) handlePlayAdjacentRequest(raw string) {
+	if b.playbackMgr == nil {
+		return
+	}
+	b.logPlaybackf("adjacent request raw=%q", raw)
+	parts := strings.SplitN(raw, "\n", 4)
+	if len(parts) < 3 {
+		b.logPlaybackf("adjacent request invalid payload")
+		b.publishAction("playback_error", "invalid playAdjacentRequest", "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+	if len(parts) >= 4 {
+		if seq, err := strconv.Atoi(strings.TrimSpace(parts[3])); err == nil {
+			if !b.acceptRequestSeq("playAdjacent", seq) {
+				return
+			}
+		}
+	}
+	currentIndex, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		b.logPlaybackf("adjacent invalid current index=%q err=%v", strings.TrimSpace(parts[0]), err)
+		b.publishAction("playback_error", "invalid current index", "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+	step, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		b.logPlaybackf("adjacent invalid step=%q err=%v", strings.TrimSpace(parts[1]), err)
+		b.publishAction("playback_error", "invalid adjacent step", "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+	shouldPlay := strings.EqualFold(strings.TrimSpace(parts[2]), "true")
+	rows := b.playbackRowsForIntent()
+	b.logPlaybackf("adjacent resolve current=%d step=%d shouldPlay=%t rows=%d", currentIndex, step, shouldPlay, len(rows))
+	intent, err := b.playbackMgr.Adjacent(rows, currentIndex, step, shouldPlay)
+	if err != nil {
+		b.logPlaybackf("adjacent resolve error: %v", err)
+		b.publishAction("playback_error", err.Error(), "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+	b.publishPlaybackAction(intent)
+}
+
+func (b *SpotifyBridge) logPlaybackf(format string, args ...any) {
+	if !b.debugPlayback {
+		return
+	}
+	fmt.Printf("[voxora][playback-intent] "+format+"\n", args...)
+}
+
+func (b *SpotifyBridge) handleComputePrebufferRequest(raw string) {
+	if b.playbackMgr == nil {
+		return
+	}
+	parts := strings.SplitN(raw, "\n", 5)
+	if len(parts) < 4 {
+		return
+	}
+	if len(parts) >= 5 {
+		if seq, err := strconv.Atoi(strings.TrimSpace(parts[4])); err == nil {
+			if !b.acceptRequestSeq("computePrebuffer", seq) {
+				return
+			}
+		}
+	}
+	currentIndex, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return
+	}
+	aheadCount, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return
+	}
+	autoplayEnabled := strings.EqualFold(strings.TrimSpace(parts[2]), "true")
+	dataSavingMode := strings.EqualFold(strings.TrimSpace(parts[3]), "true")
+
+	if !autoplayEnabled || dataSavingMode {
+		return
+	}
+
+	rows := b.playbackRowsForIntent()
+	queue := b.playbackMgr.ComputePrebufferQueue(rows, currentIndex, aheadCount)
+	if len(queue) == 0 {
+		return
+	}
+	b.prebufferTracks(strings.Join(queue, "\n"))
+}
+
+func (b *SpotifyBridge) handleEvaluateSeekRequest(raw string) {
+	if b.streamMgr == nil {
+		return
+	}
+	parts := strings.SplitN(raw, "\n", 10)
+	if len(parts) < 9 {
+		b.publishSeekAction(nil, "invalid evaluateSeekRequest")
+		return
+	}
+
+	ratio, err := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+	if err != nil {
+		b.publishSeekAction(nil, "invalid seek ratio")
+		return
+	}
+	durationMs, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		b.publishSeekAction(nil, "invalid effective duration")
+		return
+	}
+	currentPath := strings.TrimSpace(parts[2])
+	isPartStream := strings.EqualFold(strings.TrimSpace(parts[3]), "true")
+	seekEnabled := strings.EqualFold(strings.TrimSpace(parts[4]), "true")
+	cacheReady := strings.EqualFold(strings.TrimSpace(parts[5]), "true")
+	cachePath := strings.TrimSpace(parts[6])
+	bufferedBytes, err := strconv.ParseInt(strings.TrimSpace(parts[7]), 10, 64)
+	if err != nil {
+		b.publishSeekAction(nil, "invalid buffered bytes")
+		return
+	}
+	bufferedTotal, err := strconv.ParseInt(strings.TrimSpace(parts[8]), 10, 64)
+	if err != nil {
+		b.publishSeekAction(nil, "invalid buffered total")
+		return
+	}
+
+	decision := b.streamMgr.EvaluateSeek(appapi.SeekDecisionInput{
+		Ratio:                ratio,
+		EffectiveDurationMs:  durationMs,
+		CurrentPlayingPath:   currentPath,
+		IsPartStreamSource:   isPartStream,
+		SeekEnabledForSource: seekEnabled,
+		StreamCacheReady:     cacheReady,
+		StreamCachePath:      cachePath,
+		StreamBufferedBytes:  bufferedBytes,
+		StreamBufferedTotal:  bufferedTotal,
+	})
+
+	b.publishSeekAction(&decision, "")
+}
+
+func (b *SpotifyBridge) publishSeekAction(decision *appapi.SeekDecision, errMsg string) {
+	if decision == nil {
+		reason := strings.TrimSpace(errMsg)
+		if reason == "" {
+			reason = "Seek decision unavailable"
+		}
+		b.set("trackListStatus", reason)
+		b.mu.Lock()
+		b.seekDecisionSeq += 1
+		nonce := b.seekDecisionSeq
+		b.mu.Unlock()
+		b.set("seekAllowed", false)
+		b.set("seekDenyReason", reason)
+		b.set("seekDecisionNonce", nonce)
+		b.publishAction("seek_denied", reason, "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+
+	if !decision.Allow {
+		reason := strings.TrimSpace(decision.Reason)
+		if reason == "" {
+			reason = "Seek denied"
+		}
+		b.set("trackListStatus", reason)
+		b.mu.Lock()
+		b.seekDecisionSeq += 1
+		nonce := b.seekDecisionSeq
+		b.mu.Unlock()
+		b.set("seekAllowed", false)
+		b.set("seekDenyReason", reason)
+		b.set("seekDecisionNonce", nonce)
+		b.publishAction("seek_denied", reason, "", 0, 0, appapi.PlaybackIntent{})
+		return
+	}
+
+	b.mu.Lock()
+	b.seekDecisionSeq += 1
+	nonce := b.seekDecisionSeq
+	b.mu.Unlock()
+	b.set("seekAllowed", true)
+	b.set("seekDenyReason", "")
+	b.set("seekDecisionNonce", nonce)
+
+	if decision.ShouldSwitchToCache {
+		b.publishAction("seek_switch_cache", "", strings.TrimSpace(decision.TargetPath), decision.TargetPosMs, decision.TargetRatio, appapi.PlaybackIntent{})
+		return
+	}
+
+	b.publishAction("seek_apply", "", "", decision.TargetPosMs, decision.TargetRatio, appapi.PlaybackIntent{})
+}
+
+func (b *SpotifyBridge) publishAction(kind, reason, targetPath string, targetPosMs int, targetRatio float64, playback appapi.PlaybackIntent) {
+	b.mu.Lock()
+	b.actionSeq += 1
+	nonce := b.actionSeq
+	b.mu.Unlock()
+
+	b.set("actionKind", strings.TrimSpace(kind))
+	b.set("actionReason", strings.TrimSpace(reason))
+	b.set("actionTargetPath", strings.TrimSpace(targetPath))
+	b.set("actionTargetPosMs", targetPosMs)
+	b.set("actionTargetRatio", targetRatio)
+	b.set("actionTrackIndex", playback.Index)
+	b.set("actionShouldPlay", playback.ShouldPlay)
+	b.set("actionTrackName", playback.Name)
+	b.set("actionTrackURI", playback.URI)
+	b.set("actionTrackArtistText", playback.ArtistText)
+	b.set("actionTrackAlbumArtURL", playback.AlbumArtURL)
+	b.set("actionTrackDownloadedPath", playback.DownloadedPath)
+	b.set("actionTrackDurationMs", playback.DurationMs)
+	b.set("actionNonce", nonce)
+
+	if strings.TrimSpace(kind) == "playback_error" {
+		r := strings.TrimSpace(reason)
+		if r != "" {
+			b.set("trackListStatus", r)
+		}
+	}
+}
+
+func (b *SpotifyBridge) handleEvaluateRecoveryRequest(raw string) {
+	if b.streamMgr == nil {
+		return
+	}
+	parts := strings.SplitN(raw, "\n", 12)
+	if len(parts) < 11 {
+		return
+	}
+	decision := b.streamMgr.EvaluateRecovery(appapi.RecoveryDecisionInput{
+		ManualStopRequested:   strings.EqualFold(strings.TrimSpace(parts[0]), "true"),
+		StreamRecovering:      strings.EqualFold(strings.TrimSpace(parts[1]), "true"),
+		HoldStoppedTrackState: strings.EqualFold(strings.TrimSpace(parts[2]), "true"),
+		StreamSourceSwitching: strings.EqualFold(strings.TrimSpace(parts[3]), "true"),
+		CurrentPlayingPath:    strings.TrimSpace(parts[4]),
+		CachePath:             strings.TrimSpace(parts[5]),
+		StreamPlayPath:        strings.TrimSpace(parts[6]),
+		LikelyNaturalEnd:      strings.EqualFold(strings.TrimSpace(parts[7]), "true"),
+		HasNewBufferedData:    strings.EqualFold(strings.TrimSpace(parts[8]), "true"),
+		StillDownloading:      strings.EqualFold(strings.TrimSpace(parts[9]), "true"),
+		StreamRecoverAttempts: mustAtoiDefault(strings.TrimSpace(parts[10]), 0),
+	})
+
+	if decision.ShouldRecover {
+		b.publishAction("recover_stream", strings.TrimSpace(decision.Reason), "", 0, 0, appapi.PlaybackIntent{})
+	} else {
+		b.publishAction("recover_skip", strings.TrimSpace(decision.Reason), "", 0, 0, appapi.PlaybackIntent{})
+	}
+}
+
+func mustAtoiDefault(raw string, fallback int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func (b *SpotifyBridge) acceptRequestSeq(kind string, seq int) bool {
+	if seq <= 0 {
+		return true
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	switch kind {
+	case "openCollection":
+		if seq <= b.openCollectionReqSeq {
+			return false
+		}
+		b.openCollectionReqSeq = seq
+		return true
+	case "streamTrack":
+		if seq <= b.streamTrackReqSeq {
+			return false
+		}
+		b.streamTrackReqSeq = seq
+		return true
+	case "startPlayback":
+		if seq <= b.startPlaybackReqSeq {
+			return false
+		}
+		b.startPlaybackReqSeq = seq
+		return true
+	case "playAdjacent":
+		if seq <= b.playAdjacentReqSeq {
+			return false
+		}
+		b.playAdjacentReqSeq = seq
+		return true
+	case "computePrebuffer":
+		if seq <= b.computePrebufferReqSeq {
+			return false
+		}
+		b.computePrebufferReqSeq = seq
+		return true
+	case "legacyNavOpen":
+		if seq <= b.navOpenReqSeq {
+			return false
+		}
+		b.navOpenReqSeq = seq
+		return true
+	case "navigateBackNonce":
+		if seq <= b.navBackReqSeq {
+			return false
+		}
+		b.navBackReqSeq = seq
+		return true
+	case "navBackNonce":
+		if seq <= b.navBackReqSeq {
+			return false
+		}
+		b.navBackReqSeq = seq
+		return true
+	case "loadMoreTracksNonce":
+		if seq <= b.loadMoreTracksReqSeq {
+			return false
+		}
+		b.loadMoreTracksReqSeq = seq
+		return true
+	case "prebufferTracksRequest":
+		if seq <= b.prebufferTracksReqSeq {
+			return false
+		}
+		b.prebufferTracksReqSeq = seq
+		return true
+	case "clearSessionNonce":
+		if seq <= b.clearSessionReqSeq {
+			return false
+		}
+		b.clearSessionReqSeq = seq
+		return true
+	case "computePrebufferNonce":
+		if seq <= b.computePrebufferReqSeq {
+			return false
+		}
+		b.computePrebufferReqSeq = seq
+		return true
+	case "uiIntent":
+		if seq <= b.openCollectionReqSeq {
+			return false
+		}
+		b.openCollectionReqSeq = seq
+		return true
+	default:
+		return true
+	}
+}
+
+func (b *SpotifyBridge) loadSessionState() {
+	if b.sessionMgr == nil {
+		return
+	}
+	s, err := b.sessionMgr.Load()
+	if err != nil {
+		b.set("trackListStatus", "Session load failed: "+err.Error())
+		return
+	}
+	b.publishSessionState()
+
+	contextURI := strings.TrimSpace(s.ContextURI)
+	trackURI := strings.TrimSpace(s.TrackURI)
+	if contextURI != "" && trackURI != "" {
+		title := strings.TrimSpace(s.ContextName)
+		if title == "" {
+			title = "Collection"
+		}
+
+		b.mu.Lock()
+		b.resumeActive = true
+		b.resumeTargetTrackURI = trackURI
+		if s.PositionMs > 0 {
+			b.resumeTargetPosMs = s.PositionMs
+		} else {
+			b.resumeTargetPosMs = 0
+		}
+		b.mu.Unlock()
+
+		fromViewMode := strings.TrimSpace(b.props.Value("viewMode").ToString())
+		b.openCollectionContext(contextURI, title, fromViewMode)
+	} else {
+		b.clearResumePending()
+	}
+
+	b.mu.Lock()
+	b.sessionLoadedSeq += 1
+	nonce := b.sessionLoadedSeq
+	b.mu.Unlock()
+	b.set("sessionLoadedNonce", nonce)
+}
+
+func (b *SpotifyBridge) clearResumePending() {
+	b.mu.Lock()
+	b.resumeActive = false
+	b.resumeTargetTrackURI = ""
+	b.resumeTargetPosMs = 0
+	b.mu.Unlock()
+}
+
+func (b *SpotifyBridge) saveSessionStateFromBridge() {
+	if b.sessionMgr == nil {
+		return
+	}
+	b.sessionMgr.Update(func(s *appapi.SessionState) {
+		s.ContextURI = strings.TrimSpace(b.props.Value("sessionContextURI").ToString())
+		s.ContextName = strings.TrimSpace(b.props.Value("sessionContextName").ToString())
+		s.TrackURI = strings.TrimSpace(b.props.Value("sessionTrackURI").ToString())
+		s.TrackName = strings.TrimSpace(b.props.Value("sessionTrackName").ToString())
+		s.TrackArtist = strings.TrimSpace(b.props.Value("sessionTrackArtist").ToString())
+		s.AlbumArtURL = strings.TrimSpace(b.props.Value("sessionAlbumArtURL").ToString())
+		if pos, err := strconv.Atoi(strings.TrimSpace(b.props.Value("sessionPositionMs").ToString())); err == nil {
+			s.PositionMs = pos
+		}
+		if vol, err := strconv.ParseFloat(strings.TrimSpace(b.props.Value("sessionUserVolume").ToString()), 64); err == nil {
+			s.UserVolume = vol
+		}
+		s.DataSavingMode = strings.EqualFold(strings.TrimSpace(b.props.Value("sessionDataSavingMode").ToString()), "true")
+	})
+	if err := b.sessionMgr.Save(); err != nil {
+		b.set("trackListStatus", "Session save failed: "+err.Error())
+		return
+	}
+	b.publishSessionState()
 }
 
 func (b *SpotifyBridge) Object() *qml.QQmlPropertyMap {
@@ -464,7 +1574,6 @@ func (b *SpotifyBridge) startFlow() {
 	b.mu.Unlock()
 
 	b.set("isBusy", true)
-	b.set("state", "pending")
 	b.set("statusText", "Spotify auth: starting...")
 	b.set("lastError", "")
 
@@ -477,7 +1586,6 @@ func (b *SpotifyBridge) startFlow() {
 		b.flowCancel = nil
 		b.mu.Unlock()
 		b.set("isBusy", false)
-		b.set("state", "error")
 		b.set("lastError", err.Error())
 		b.set("statusText", "Spotify auth: failed to start")
 		return
@@ -487,7 +1595,6 @@ func (b *SpotifyBridge) startFlow() {
 	b.flow = start.Flow
 	b.mu.Unlock()
 
-	b.set("authUrl", start.AuthURL)
 	b.set("statusText", "Spotify auth: waiting for browser callback...")
 	log.WithField("callback_port", start.CallbackPort).Info("interactive auth callback server started")
 	log.WithField("auth_url", start.AuthURL).Debug("opening spotify auth URL in external browser")
@@ -529,8 +1636,6 @@ func (b *SpotifyBridge) startFlow() {
 	b.resetSharedDownloader()
 
 	b.set("isBusy", false)
-	b.set("state", "completed")
-	b.set("username", strings.TrimSpace(result.Username))
 	b.set("lastError", "")
 	if u := strings.TrimSpace(result.Username); u != "" {
 		b.set("statusText", "Spotify auth: connected ("+u+")")
@@ -543,7 +1648,6 @@ func (b *SpotifyBridge) startFlow() {
 
 func (b *SpotifyBridge) bootstrapExistingAuth() {
 	b.set("isBusy", true)
-	b.set("state", "checking")
 	b.set("statusText", "Spotify auth: checking cached credentials...")
 
 	credentialsFile := bridgeCredentialsFile()
@@ -551,7 +1655,6 @@ func (b *SpotifyBridge) bootstrapExistingAuth() {
 	hasStored, err := libspotdl.HasStoredCredentials(credentialsFile)
 	if err != nil {
 		b.set("isBusy", false)
-		b.set("state", "error")
 		b.set("lastError", err.Error())
 		b.set("statusText", "Spotify auth: failed checking cache")
 		return
@@ -564,7 +1667,6 @@ func (b *SpotifyBridge) bootstrapExistingAuth() {
 
 	if hasStored {
 		b.set("isBusy", false)
-		b.set("state", "completed")
 		b.set("lastError", "")
 		b.set("statusText", "Spotify auth: using cached credentials")
 		go b.loadLibrary()
@@ -573,14 +1675,12 @@ func (b *SpotifyBridge) bootstrapExistingAuth() {
 
 	if hasOAuth {
 		b.set("isBusy", false)
-		b.set("state", "idle")
 		b.set("lastError", "")
 		b.set("statusText", "Spotify auth: token cached, finish connection")
 		return
 	}
 
 	b.set("isBusy", false)
-	b.set("state", "idle")
 	b.set("lastError", "")
 	b.set("statusText", "Spotify auth: not connected")
 }
@@ -599,7 +1699,6 @@ func (b *SpotifyBridge) loadLibrary() {
 	if err != nil {
 		errText := strings.ToLower(err.Error())
 		if strings.Contains(errText, "no cached spotify oauth access token") || strings.Contains(errText, "status 401") {
-			b.set("state", "idle")
 			b.set("lastError", err.Error())
 			b.set("statusText", "Spotify auth: session expired, reauth needed")
 			b.set("libraryStatus", "Spotify library: re-authenticate to refresh access token")
@@ -607,7 +1706,6 @@ func (b *SpotifyBridge) loadLibrary() {
 			return
 		}
 		if strings.Contains(errText, "insufficient client scope") {
-			b.set("state", "idle")
 			b.set("lastError", err.Error())
 			b.set("statusText", "Spotify auth: additional permissions required, reauth needed")
 			b.set("libraryStatus", "Spotify library: re-authenticate to grant playlist/library scopes")
@@ -615,7 +1713,6 @@ func (b *SpotifyBridge) loadLibrary() {
 			return
 		}
 		if libspotdl.IsSpotifyCredentialRefusedError(err) {
-			b.set("state", "idle")
 			b.set("lastError", err.Error())
 			b.set("statusText", "Spotify auth: cached credentials rejected, reauth required")
 			b.set("libraryStatus", "Spotify library: requires re-authentication")
@@ -636,7 +1733,6 @@ func (b *SpotifyBridge) loadLibrary() {
 		playlistsJSON = string(encoded)
 	}
 	b.set("playlistsJson", playlistsJSON)
-	b.set("playlistsCount", len(snapshot.Playlists))
 	b.set("likedSongsName", snapshot.Liked.Name)
 	b.set("likedSongsCount", snapshot.Liked.TrackCount)
 	if snapshot.LikedAvailable {
@@ -647,19 +1743,11 @@ func (b *SpotifyBridge) loadLibrary() {
 	b.set("libraryStatus", fmt.Sprintf("Spotify library: playlists loaded (%d), liked songs unavailable", len(snapshot.Playlists)))
 }
 
-func (b *SpotifyBridge) openCollection(raw string) {
-	parts := strings.SplitN(raw, "\n", 3)
-	if len(parts) < 2 {
-		return
-	}
+func (b *SpotifyBridge) openCollectionContext(contextURI, title, fromViewMode string) {
 
-	contextURI := strings.TrimSpace(parts[0])
-	title := strings.TrimSpace(parts[1])
-	if contextURI == "" {
-		return
-	}
-	if title == "" {
-		title = "Tracks"
+	if b.navMgr != nil {
+		b.navMgr.OpenCollection(contextURI, title, fromViewMode)
+		b.publishNavigationState()
 	}
 
 	b.set("isLoadingTracks", true)
@@ -667,9 +1755,12 @@ func (b *SpotifyBridge) openCollection(raw string) {
 	b.set("trackListStatus", "Loading tracks...")
 	b.set("trackListJson", "[]")
 	b.set("trackHasMore", false)
-	b.set("trackTotal", 0)
 	b.set("lastError", "")
 	b.set("viewMode", "tracks")
+	if b.trackModel != nil {
+		b.trackModel.Reset()
+		b.publishTrackModelState()
+	}
 
 	b.mu.Lock()
 	b.trackContextURI = contextURI
@@ -757,7 +1848,7 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 
 	b.publishTrackList(allTracks)
 	b.set("trackHasMore", page.HasMore)
-	b.set("trackTotal", page.Total)
+	b.tryDispatchResumeSelection(allTracks, page.HasMore)
 	loadedCount := len(allTracks)
 	if page.HasMore {
 		if page.Total > 0 {
@@ -773,6 +1864,50 @@ func (b *SpotifyBridge) loadNextTrackPage() {
 		}
 	}
 	b.set("isLoadingTracks", false)
+}
+
+func (b *SpotifyBridge) tryDispatchResumeSelection(allTracks []libspotdl.LibraryTrackSummary, hasMore bool) {
+	b.mu.Lock()
+	resumeActive := b.resumeActive
+	targetURI := strings.TrimSpace(b.resumeTargetTrackURI)
+	targetPos := b.resumeTargetPosMs
+	b.mu.Unlock()
+
+	if !resumeActive || targetURI == "" {
+		return
+	}
+
+	resumeIndex := -1
+	for i := range allTracks {
+		if strings.TrimSpace(allTracks[i].URI) == targetURI {
+			resumeIndex = i
+			break
+		}
+	}
+
+	if resumeIndex >= 0 {
+		track := allTracks[resumeIndex]
+		intent := appapi.PlaybackIntent{
+			Index:          resumeIndex,
+			ShouldPlay:     false,
+			Name:           strings.TrimSpace(track.Name),
+			URI:            strings.TrimSpace(track.URI),
+			ArtistText:     strings.TrimSpace(track.ArtistText),
+			AlbumArtURL:    strings.TrimSpace(track.AlbumArtURL),
+			DownloadedPath: strings.TrimSpace(track.DownloadedPath),
+			DurationMs:     int(track.DurationMs),
+		}
+		b.publishAction("playback_select", "session_resume", "", targetPos, 0, intent)
+		b.clearResumePending()
+		return
+	}
+
+	if !hasMore {
+		b.clearResumePending()
+		return
+	}
+
+	go b.loadNextTrackPage()
 }
 
 func defaultDownloadDir() string {
@@ -1052,10 +2187,6 @@ func (b *SpotifyBridge) clearAllStreamCache() {
 	b.set("trackListStatus", fmt.Sprintf("Cleared %d stream cache file(s)", removed))
 }
 
-func (b *SpotifyBridge) prebufferTrack(raw string) {
-	b.prebufferTracks(raw)
-}
-
 func (b *SpotifyBridge) clearPrebuffer() {
 	b.mu.Lock()
 	if b.prebufferCancel != nil {
@@ -1190,6 +2321,13 @@ func (b *SpotifyBridge) streamTrack(raw string) {
 	parts := strings.SplitN(raw, "\n", 3)
 	if len(parts) < 1 {
 		return
+	}
+	if len(parts) >= 3 {
+		if seq, err := strconv.Atoi(strings.TrimSpace(parts[2])); err == nil {
+			if !b.acceptRequestSeq("streamTrack", seq) {
+				return
+			}
+		}
 	}
 
 	trackURI := strings.TrimSpace(parts[0])
@@ -1905,6 +3043,10 @@ func (b *SpotifyBridge) publishTrackList(items []libspotdl.LibraryTrackSummary) 
 		tracksJSON = string(encoded)
 	}
 	b.set("trackListJson", tracksJSON)
+	if b.trackModel != nil {
+		b.trackModel.UpdateFromSummaries(items)
+		b.publishTrackModelState()
+	}
 }
 
 func (b *SpotifyBridge) downloadTrack(raw string) {
@@ -2035,7 +3177,6 @@ func (b *SpotifyBridge) finishWithError(message string) {
 	b.mu.Unlock()
 
 	b.set("isBusy", false)
-	b.set("state", "error")
 	b.set("lastError", message)
 	b.set("statusText", "Spotify auth: failed")
 }
